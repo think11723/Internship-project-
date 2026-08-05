@@ -565,11 +565,22 @@ def generate_recommendation(
     Pure deterministic. ``resume`` may be None if no resume is uploaded;
     in that case scores degrade gracefully and ``data_sufficiency``
     is reported as ``"insufficient"``.
+
+    Sprint 5: this function now also calls
+    ``application_strategy.build_application_strategy`` and merges the
+    returned fields (overall_recommendation, why_apply, strengths,
+    skill_gaps, learning_path, suggested_projects, interview_topics,
+    best_team, estimated_interview_difficulty, confidence) into the
+    result. The merge is additive — existing keys are preserved.
     """
     enrichment = company.get("enrichment") or {}
 
+    # Sprint 5: import lazily to avoid an import cycle (career_intelligence
+    # already imports many services; application_strategy is pure).
+    from app.services.application_strategy import build_application_strategy
+
     if resume is None:
-        return {
+        recommendation: Dict[str, Any] = {
             "scores": {
                 "hiring_confidence": _score_hiring_confidence(enrichment),
                 "technical_fit": 0,
@@ -606,6 +617,15 @@ def generate_recommendation(
             "input_resume_id": None,
             "input_company": company.get("name", ""),
         }
+        # Sprint 5: merge application strategy fields even when no resume
+        # is uploaded (data is Unknown / "Insufficient Data" labels).
+        scores_insufficient = recommendation["scores"]
+        recommendation.update(
+            build_application_strategy(
+                company, resume, enrichment=enrichment, scores=scores_insufficient
+            )
+        )
+        return recommendation
 
     scores = {
         "hiring_confidence": _score_hiring_confidence(enrichment),
@@ -626,7 +646,7 @@ def generate_recommendation(
     improvements = _resume_improvements(resume, enrichment)
     why = _build_why(resume, enrichment, scores, gaps)
 
-    return {
+    recommendation = {
         "scores": scores,
         "application_priority": priority,
         "why": why,
@@ -641,6 +661,19 @@ def generate_recommendation(
         "input_resume_id": resume.get("id"),
         "input_company": company.get("name", ""),
     }
+
+    # Sprint 5: merge the personalised Application Strategy fields
+    # (overall_recommendation, why_apply, strengths, skill_gaps,
+    # learning_path, suggested_projects, interview_topics, best_team,
+    # estimated_interview_difficulty, confidence) into the existing
+    # recommendation. Existing keys are preserved; new keys are added.
+    recommendation.update(
+        build_application_strategy(
+            company, resume, enrichment=enrichment, scores=scores
+        )
+    )
+
+    return recommendation
 
 
 def aggregate_recommendation_metrics(

@@ -10,21 +10,25 @@ const INDUSTRY_FILTERS = [
     label: 'All',
     match: null,
   },
+  // Sprint 4 B5: chips now match the actual industries present in
+  // backend/app/data/seed_companies.json (and any future live
+  // discoveries). Previously three chips referenced industries
+  // ('Fintech AI', 'Health AI', 'Security') that never appeared in
+  // any record, so those filters silently returned zero results.
   {
-    id: 'ai',
-    label: 'AI',
-    match: [
-      'AI Research',
-      'Generative AI',
-      'AI Search',
-      'Foundation Models',
-      'Enterprise AI',
-      'Vertical AI',
-      'Computer Vision',
-      'Generative Video',
-      'AI Silicon',
-      'AI Platform',
-    ],
+    id: 'ai-research',
+    label: 'AI Research',
+    match: ['AI Research'],
+  },
+  {
+    id: 'ai-platform',
+    label: 'AI Platform',
+    match: ['AI Platform'],
+  },
+  {
+    id: 'foundation-models',
+    label: 'Foundation Models',
+    match: ['Foundation Models'],
   },
   {
     id: 'developer-tools',
@@ -33,23 +37,28 @@ const INDUSTRY_FILTERS = [
   },
   {
     id: 'infrastructure',
-    label: 'Infrastructure',
-    match: ['AI Infrastructure', 'MLOps', 'Enterprise Search'],
+    label: 'AI Infrastructure',
+    match: ['AI Infrastructure', 'MLOps', 'AI Silicon'],
   },
   {
-    id: 'fintech',
-    label: 'FinTech',
-    match: ['Fintech AI'],
+    id: 'enterprise-ai',
+    label: 'Enterprise AI',
+    match: ['Enterprise AI', 'Enterprise Search', 'Vertical AI'],
   },
   {
-    id: 'healthcare',
-    label: 'Healthcare',
-    match: ['Health AI'],
+    id: 'generative-ai',
+    label: 'Generative AI',
+    match: ['Generative AI', 'Generative Video'],
   },
   {
-    id: 'security',
-    label: 'Security',
-    match: ['Security'],
+    id: 'computer-vision',
+    label: 'Computer Vision',
+    match: ['Computer Vision'],
+  },
+  {
+    id: 'ai-search',
+    label: 'AI Search',
+    match: ['AI Search'],
   },
 ]
 

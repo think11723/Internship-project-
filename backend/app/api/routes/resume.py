@@ -153,6 +153,17 @@ async def upload_resume(
         temp_file_path = UPLOAD_DIR / f"{file_id}.pdf"
         temp_file_path.write_bytes(content)
 
+        # Single-active-resume policy (Sprint 4 B1): uploading a new
+        # resume REPLACES any existing row. The "Replace" button on
+        # the frontend used to APPEND, leaking rows and confusing the
+        # "latest" lookup. Clear all rows before insert.
+        try:
+            db.query(Resume).delete()
+            db.commit()
+        except Exception as exc:
+            logger.warning("Resume replace: pre-insert delete failed: %s", exc)
+            db.rollback()
+
         _job_update(job_id, "Reading PDF", "running")
 
         # Process resume with timing + per-stage progress writes

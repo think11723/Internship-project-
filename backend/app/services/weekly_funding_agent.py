@@ -197,16 +197,26 @@ def discover_last_week_funding(
 def run_weekly_refresh(force: bool = False) -> Dict[str, Any]:
     """One tick of the weekly scheduler.
 
-    Behavior:
+    Behavior (Ticket-CRITICAL-1):
       - If the cache is younger than ``DISCOVERY_CACHE_HOURS`` and
         ``force`` is False, returns ``{status: "skipped", ...}``.
       - Otherwise calls ``discover_last_week_funding``.
-      - If Tavily/Firecrawl themselves fail (missing key, network
-        error, no results), writes the curated seed to the cache so
-        the page is never empty.
-      - On success, writes the LLM-free deterministic records to the
-        cache. LLM failures NEVER trigger seed fallback — they only
-        mean we ship the deterministic record without LLM enrichment.
+      - On success (≥1 record returned), writes the deterministic
+        records to the cache with ``data_source="live"``. The
+        discovery succeeded regardless of Firecrawl or LLM enrichment
+        status — those are best-effort and never block.
+      - On zero records OR hard upstream failure (Tavily missing key,
+        network error, no results):
+
+          * **Branch A — no cache exists:** initialise the cache
+            with the curated seed dataset and ``data_source="seed"``.
+            This is acceptable because there is no real data to lose.
+          * **Branch B — cache exists:** DO NOT TOUCH THE CACHE.
+            The existing live (or seed) data is preserved. The
+            response signals this with ``status="preserved"``.
+
+    LLM failures NEVER trigger seed fallback — they only mean we
+    ship the deterministic record without LLM enrichment.
 
     Safe to call concurrently with ``_load_companies`` — the cache
     file is the synchronization point.
@@ -221,6 +231,7 @@ def run_weekly_refresh(force: bool = False) -> Dict[str, Any]:
                 "status": "skipped",
                 "reason": "cache is fresh",
                 "cached_at": metadata.get("cached_at"),
+                "data_source": metadata.get("data_source"),
             }
 
     today = date.today()
@@ -228,48 +239,91 @@ def run_weekly_refresh(force: bool = False) -> Dict[str, Any]:
     window_start = week_ago.isoformat()
     window_end = today.isoformat()
 
+    # Try the live discovery. Any exception is captured for the
+    # response envelope; the seed-write branch below is gated by the
+    # presence of an existing cache.
+    companies: List[Dict[str, Any]] = []
+    discovery_error: Optional[str] = None
     try:
         companies = discover_last_week_funding(
             lookback_days=settings.WEEKLY_AGENT_LOOKBACK_DAYS
         )
-        if not companies:
-            logger.warning(
-                "WeeklyFundingAgent: zero deterministic records for window "
-                "%s..%s; falling back to seed",
-                window_start,
-                window_end,
-            )
-            seed = _seed_fallback()
-            _write_cache(seed)
-            return {
-                "status": "ok",
-                "companies_count": len(seed),
-                "window": f"{window_start}..{window_end}",
-                "fell_back_to_seed": True,
-                "cached_at": _CACHE_PATH.stat().st_mtime,
-            }
-        _write_cache(companies)
+    except Exception as exc:
+        discovery_error = str(exc)
+        logger.warning(
+            "WeeklyFundingAgent: discovery raised (%s); will preserve "
+            "existing cache or fall back to seed only if no cache exists.",
+            exc,
+        )
+
+    # ── Branch A — live discovery succeeded ────────────────────────
+    if companies:
+        _write_cache(
+            companies,
+            data_source="live",
+            reason=(
+                "successful Tavily + deterministic extraction for "
+                f"window {window_start}..{window_end}"
+            ),
+        )
         return {
             "status": "ok",
             "companies_count": len(companies),
             "window": f"{window_start}..{window_end}",
             "fell_back_to_seed": False,
+            "data_source": "live",
             "cached_at": _CACHE_PATH.stat().st_mtime,
         }
-    except Exception as exc:
-        # Hard upstream failure (Tavily or Firecrawl). Seed fallback is
-        # the right move here — never an LLM failure.
+
+    # ── Live discovery returned 0 or raised ────────────────────────
+    existing = _read_cache()
+    if existing is not None:
+        # ── Branch B — preserve existing cache ────────────────────
+        metadata = existing.get("metadata", {}) if isinstance(existing, dict) else {}
+        existing_source = metadata.get("data_source", "unknown")
         logger.warning(
-            "WeeklyFundingAgent: discovery failed (%s); falling back to seed",
-            exc,
+            "WeeklyFundingAgent: discovery produced 0 records "
+            "(error=%s); PRESERVING existing cache (data_source=%s, "
+            "%d companies). No silent overwrite.",
+            discovery_error or "no_results",
+            existing_source,
+            metadata.get("companies_count", 0),
         )
-        seed = _seed_fallback()
-        _write_cache(seed)
         return {
-            "status": "ok",
-            "companies_count": len(seed),
+            "status": "preserved",
+            "reason": (
+                "discovery produced no records; existing cache preserved"
+            ),
+            "companies_count": metadata.get("companies_count", 0),
             "window": f"{window_start}..{window_end}",
-            "fell_back_to_seed": True,
-            "error": str(exc),
-            "cached_at": _CACHE_PATH.stat().st_mtime,
+            "fell_back_to_seed": False,
+            "data_source": existing_source,
+            "discovery_error": discovery_error,
+            "cached_at": metadata.get("cached_at"),
         }
+
+    # ── Branch C — first deployment; no cache exists ──────────────
+    logger.warning(
+        "WeeklyFundingAgent: first deployment with no cache; "
+        "discovery failed (%s); initialising with curated seed.",
+        discovery_error or "no_results",
+    )
+    seed = _seed_fallback()
+    _write_cache(
+        seed,
+        data_source="seed",
+        reason=(
+            "first deployment: live discovery produced no records "
+            f"(error={discovery_error or 'no_results'}); seeded for "
+            "non-empty UI"
+        ),
+    )
+    return {
+        "status": "ok",
+        "companies_count": len(seed),
+        "window": f"{window_start}..{window_end}",
+        "fell_back_to_seed": True,
+        "data_source": "seed",
+        "discovery_error": discovery_error,
+        "cached_at": _CACHE_PATH.stat().st_mtime,
+    }

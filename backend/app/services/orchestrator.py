@@ -51,7 +51,14 @@ def _load_seed_companies() -> List[Dict[str, Any]]:
 
 
 def _read_cache() -> Optional[Dict[str, Any]]:
-    """Return cached discovery if it exists and is fresh, else None with metadata."""
+    """Return cached discovery if it exists and is fresh, else None with metadata.
+
+    Tolerates BOTH the legacy flat-list format (``[{...}, {...}]``)
+    and the current envelope format (``{"companies": [...],
+    "metadata": {...}}``). The legacy list is normalised into the
+    envelope on read so downstream code can always rely on the
+    envelope shape.
+    """
     if not _CACHE_PATH.exists():
         return None
     age_hours = (time.time() - _CACHE_PATH.stat().st_mtime) / 3600.0
@@ -60,9 +67,33 @@ def _read_cache() -> Optional[Dict[str, Any]]:
     try:
         with open(_CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list) and data:
+        if isinstance(data, dict) and isinstance(data.get("companies"), list):
+            # Current envelope format.
             logger.info(
-                "Using cached discovery (%d companies, %.1fh old)",
+                "Using cached discovery (%d companies, %.1fh old, source=%s)",
+                len(data["companies"]),
+                age_hours,
+                data.get("metadata", {}).get("data_source", "unknown"),
+            )
+            # Merge read-time metadata with the persisted metadata.
+            persisted_meta = data.get("metadata") or {}
+            return {
+                "companies": data["companies"],
+                "metadata": {
+                    **persisted_meta,
+                    "cache_hit": True,
+                    "age_hours": round(age_hours, 2),
+                    "cached_at": persisted_meta.get(
+                        "cached_at", time.ctime(_CACHE_PATH.stat().st_mtime)
+                    ),
+                    "cache_path": str(_CACHE_PATH),
+                },
+            }
+        if isinstance(data, list) and data:
+            # Legacy flat-list format — normalise to envelope.
+            logger.info(
+                "Using cached discovery in legacy flat-list format "
+                "(%d companies, %.1fh old)",
                 len(data),
                 age_hours,
             )
@@ -73,14 +104,21 @@ def _read_cache() -> Optional[Dict[str, Any]]:
                     "age_hours": round(age_hours, 2),
                     "cached_at": time.ctime(_CACHE_PATH.stat().st_mtime),
                     "cache_path": str(_CACHE_PATH),
-                }
+                    "data_source": "unknown",
+                    "reason": "legacy cache (flat-list format)",
+                    "fallback": False,
+                },
             }
     except Exception as exc:
         logger.warning("Failed to read discovery cache: %s", exc)
     return None
 
 
-def _write_cache(companies: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _write_cache(
+    companies: Any,
+    data_source: str = "live",
+    reason: str = "",
+) -> Dict[str, Any]:
     """Persist discovered companies to the cache file with metadata.
 
     Always writes a dict envelope so the cache can carry
@@ -88,7 +126,30 @@ def _write_cache(companies: List[Dict[str, Any]]) -> Dict[str, Any]:
     recommendations_generated_at, etc.) alongside the company list.
     Reads any existing envelope to preserve those fields across
     discovery overwrites.
+
+    The ``companies`` parameter may be either:
+      * a list of company dicts (the common case), or
+      * a pre-built envelope dict ``{"companies": [...], "metadata":
+        {...}}`` (legacy callers like ``run_enrichment``).
+
+    Either form is normalised to a list before persisting.
+
+    ``data_source`` records whether the cache holds real live
+    discoveries (``"live"``) or curated seed fallback (``"seed"``).
+    ``reason`` is a free-text explanation of why this write happened
+    (e.g. ``"successful Tavily discovery for window YYYY-MM-DD..YYYY-MM-DD"``
+    or ``"first deployment: Tavily failed; seeded for non-empty UI"``).
+
+    Defaults to ``data_source="live"`` so existing callers behave
+    identically; only explicit seed initialisation passes
+    ``data_source="seed"``.
     """
+    # Normalise legacy envelope-dict input to a plain list.
+    if isinstance(companies, dict) and isinstance(companies.get("companies"), list):
+        companies = companies["companies"]
+    elif not isinstance(companies, list):
+        companies = list(companies) if companies else []
+
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         existing: Dict[str, Any] = {}
@@ -105,9 +166,11 @@ def _write_cache(companies: List[Dict[str, Any]]) -> Dict[str, Any]:
                 **existing.get("metadata", {}),
                 "cache_hit": False,
                 "cached_at": time.time(),
-                "cached_at_human": time.ctime(_CACHE_PATH.stat().st_mtime),
                 "cache_path": str(_CACHE_PATH),
                 "companies_count": len(companies),
+                "data_source": data_source,
+                "reason": reason or "",
+                "fallback": data_source == "seed",
             },
         }
         # Preserve Career Intelligence metadata if present.
@@ -117,12 +180,23 @@ def _write_cache(companies: List[Dict[str, Any]]) -> Dict[str, Any]:
                 envelope[key] = existing[key]
         with open(_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(envelope, f, indent=2)
-        logger.info("Cached %d discovered companies", len(companies))
+        # Now that the file exists, populate cached_at_human from its
+        # mtime so the human-readable timestamp matches the actual
+        # file write.
+        envelope["metadata"]["cached_at_human"] = time.ctime(
+            _CACHE_PATH.stat().st_mtime
+        )
+        logger.info(
+            "Cached %d discovered companies (data_source=%s)",
+            len(companies), data_source,
+        )
         return {
             "cache_hit": False,
             "cached_at": envelope["metadata"]["cached_at_human"],
             "cache_path": str(_CACHE_PATH),
             "companies_count": len(companies),
+            "data_source": data_source,
+            "fallback": data_source == "seed",
         }
     except Exception as exc:
         logger.warning("Failed to write discovery cache: %s", exc)
@@ -204,33 +278,60 @@ def _run_discovery() -> List[Dict[str, Any]]:
 
 
 def _load_companies() -> List[Dict[str, Any]]:
-    """Smart loader: cache -> live discovery -> Demo Data fallback.
+    """Smart loader: cache -> live discovery -> first-deployment seed.
 
     Never raises. Always returns a non-empty list of companies.
 
-    On cache miss we run live discovery. If discovery fails for any
-    reason (missing keys, network error, model rot) we fall back to
-    the curated Demo Data and **persist that fallback to the cache** so
-    subsequent requests are instant — we never run the same failing
-    discovery twice in a row.
+    Production-safety rule (Ticket-CRITICAL-1): real live discoveries
+    are NEVER silently overwritten by the curated seed dataset. The
+    seed fallback is only allowed on first deployment — i.e. when no
+    cache file exists yet.
+
+    - **Cache hit with live data** → return cached companies verbatim.
+    - **Cache hit with seed data** → return cached seed verbatim (do
+      NOT attempt live re-discovery here; that is the weekly
+      scheduler's job).
+    - **Cache miss + live discovery succeeds** → write + return live
+      data with ``data_source="live"``.
+    - **Cache miss + live discovery fails** → write + return seed with
+      ``data_source="seed"`` (acceptable only because no real data
+      exists yet to lose).
     """
     cached = _read_cache()
     if cached is not None:
+        # Existing cache is authoritative. Return its companies verbatim,
+        # regardless of data_source. The caller can inspect metadata to
+        # decide whether to surface "seed fallback" UI hints.
         return cached["companies"] if isinstance(cached, dict) else cached
 
+    # No cache exists — this is first deployment (or the cache was
+    # manually invalidated). Live discovery is permitted; if it fails,
+    # the seed fallback is acceptable because there is no real data to
+    # overwrite.
     try:
         companies = _run_discovery()
-        _write_cache(companies)
+        _write_cache(
+            companies,
+            data_source="live",
+            reason="successful live discovery (first deployment)",
+        )
         return companies
     except Exception as exc:
         logger.warning(
-            "Live discovery unavailable (%s); using Demo Data and "
-            "caching it as a fallback so subsequent requests are instant",
+            "Live discovery unavailable on first deployment (%s); "
+            "initialising cache with curated seed data. This fallback "
+            "will be replaced on the next successful weekly refresh.",
             exc,
         )
         seed = _load_seed_companies()
-        # Cache the fallback so we don't repeat the failing discovery.
-        _write_cache(seed)
+        _write_cache(
+            seed,
+            data_source="seed",
+            reason=(
+                "first deployment: live discovery failed (%s); seeded "
+                "for non-empty UI" % exc
+            ),
+        )
         return seed
 
 

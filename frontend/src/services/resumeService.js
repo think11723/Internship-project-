@@ -21,15 +21,6 @@ export const uploadResume = async (file, options = {}) => {
 }
 
 /**
- * Get resume analysis by id
- * @param {number} id - Resume ID
- * @returns {Promise} Promise with resume data
- */
-export const getResume = async (id) => {
-  return api.get(`/api/resume/${id}`)
-}
-
-/**
  * Get latest resume metadata (used by the "Current Resume" card)
  * @returns {Promise} Promise resolving to {id, original_filename, parsed_at, name, email, summary, skills_count, file_size, status}
  */

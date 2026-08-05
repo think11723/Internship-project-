@@ -27,12 +27,3 @@ export const getCompanies = async (params = {}) => {
 export const getCompany = async (companyName) => {
   return api.get(`/api/companies/${encodeURIComponent(companyName)}`)
 }
-
-/**
- * Research a specific company
- * @param {number} id - Company ID
- * @returns {Promise} Promise with research result
- */
-export const researchCompany = async (id) => {
-  return api.post(`/api/companies/${id}/research`)
-}

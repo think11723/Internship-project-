@@ -203,13 +203,125 @@ _CULTURE_PHRASES = [
     ("open-source", re.compile(r"\bopen[- ]source\b", re.IGNORECASE)),
 ]
 
+# ─── Publisher / Aggregator blocklists (Sprint 3) ─────────────────────
+# These domains MUST NEVER be returned as ``company_website`` or
+# ``careers_page_url``. They are publishers, aggregators, social
+# platforms, or profile directories — not company websites.
 _NEWS_DOMAINS = {
     "techcrunch.com", "crunchbase.com", "venturebeat.com",
-    "forbes.com", "techstartups.com", "linkedin.com",
-    "twitter.com", "facebook.com", "reddit.com",
-    "reuters.com", "bloomberg.com", "wsj.com", "nytimes.com",
-    "tech.co", "yahoo.com", "github.com",
+    "forbes.com", "techstartups.com", "reuters.com", "bloomberg.com",
+    "wsj.com", "nytimes.com", "tech.co", "yahoo.com", "cnbc.com",
+    "bbc.com", "theverge.com", "wired.com", "businessinsider.com",
+    "fastcompany.com", "inc.com", "eu-startups.com", "seedtable.com",
+    "sifted.eu",
 }
+
+_AGGREGATOR_DOMAINS = {
+    "linkedin.com", "twitter.com", "x.com", "facebook.com",
+    "reddit.com", "instagram.com", "youtube.com", "tiktok.com",
+    "medium.com", "substack.com", "wikipedia.org", "en.wikipedia.org",
+    "pitchbook.com", "cbinsights.com", "owler.com", "tracxn.com",
+    "dealroom.co", "f6s.com", "wellfound.com", "angel.co",
+    "ycombinator.com",
+    "sec.gov", "edgar.sec.gov",
+    "producthunt.com", "hackernews.com", "news.ycombinator.com",
+    "glassdoor.com", "indeed.com", "monster.com",
+    "businesswire.com", "prnewswire.com", "globenewswire.com",
+    "prweb.com", "einnewswire.com",
+}
+
+# Known Applicant-Tracking-System hosts. When we find a careers page
+# URL whose host matches one of these, the URL is treated as a
+# verified external ATS link (Greenhouse, Lever, Ashby, Workable,
+# Teamtailor, SmartRecruiters, Rippling, etc.). These are HIGH
+# confidence — companies posting here typically host the canonical
+# jobs board there.
+_ATS_HOST_PATTERNS = [
+    re.compile(r"^boards\.greenhouse\.io$"),
+    re.compile(r"^boards\.eu\.greenhouse\.io$"),
+    re.compile(r"^jobs\.lever\.co$"),
+    re.compile(r"^jobs\.ashbyhq\.com$"),
+    re.compile(r"^apply\.workable\.com$"),
+    re.compile(r"^teamtailor\.com$"),
+    re.compile(r"^jobs\.smartrecruiters\.com$"),
+    re.compile(r"^.*\.teamtailor\.com$"),
+    re.compile(r"^jobs\.rippling\.com$"),
+    re.compile(r"^pinpoint\.com$"),
+    re.compile(r"^.*\.bamboohr\.com$"),
+    re.compile(r"^.*\.recruitee\.com$"),
+    re.compile(r"^.*\.workday\.com$"),
+    re.compile(r"^.*\.myworkdayjobs\.com$"),
+    re.compile(r"^.*\.jobvite\.com$"),
+    re.compile(r"^.*\.icims\.com$"),
+    re.compile(r"^.*\.jobvite\.com$"),
+    re.compile(r"^.*\.taleo\.net$"),
+    re.compile(r"^.*\.successfactors\.com$"),
+]
+
+# Career-page path suffixes to probe (in priority order) when we have
+# a verified company domain.
+_CAREERS_PATH_CANDIDATES = (
+    "/careers",
+    "/jobs",
+    "/work-with-us",
+    "/join-us",
+    "/team",
+    "/about/careers",
+    "/company/careers",
+    "/company/jobs",
+)
+
+
+def _is_ats_host(host: str) -> bool:
+    """Return True if ``host`` is a known Applicant Tracking System."""
+    host = (host or "").lower()
+    for pat in _ATS_HOST_PATTERNS:
+        if pat.match(host):
+            return True
+    return False
+
+
+def _is_non_company_host(host: str) -> bool:
+    """Return True if ``host`` is a publisher, aggregator, social
+    platform, or profile directory that should NEVER be treated as a
+    company website.
+    """
+    host = (host or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return False
+    if host in _NEWS_DOMAINS:
+        return True
+    if host in _AGGREGATOR_DOMAINS:
+        return True
+    # Subdomain-aware: a.bloomberg.com is also a publisher.
+    for d in _NEWS_DOMAINS:
+        if host.endswith("." + d):
+            return True
+    for d in _AGGREGATOR_DOMAINS:
+        if host.endswith("." + d):
+            return True
+    return False
+
+
+def _normalize_host(url: str) -> str:
+    """Return the lowercased host (no www., no port, no path)."""
+    if not url:
+        return ""
+    url = url.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    try:
+        host = url.split("/")[2]
+    except IndexError:
+        return ""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    return host
 
 
 # ─── HTTP wrappers ─────────────────────────────────────────────────────
@@ -267,44 +379,420 @@ def _clean_url(url: str) -> Optional[str]:
     return url
 
 
-def _find_company_website(company_name: str) -> Optional[str]:
-    results = _tavily_search(f"{company_name} official website", max_results=5)
-    for r in results:
+def _domain_for_company_name(company_name: str) -> List[str]:
+    """Heuristically derive candidate domains from a company name.
+
+    Returns plausible domain roots ordered by PRIORITY (best first):
+      1. First-word slug + .com   (handles "Scale AI" -> scale.com,
+                                   "Anthropic PBC" -> anthropic.com)
+      2. First-word slug + .ai    (handles "Perplexity AI" -> perplexity.ai)
+      3. First-word slug + .io    (handles "ElevenLabs" -> elevenlabs.io)
+      4. First-word slug + .co    (handles "Hugging Face" -> hugging.co,
+                                   though huggingface.co is more common)
+      5. Full-name slug + .com    ("Anthropic" -> anthropic.com)
+      6. Full-name slug + .ai
+      7. Full-name slug + .io
+
+    First-word priority reflects that many real companies (Scale,
+    Perplexity, Mistral, Anthropic, Harvey, Modular, Cohere, Glean,
+    Replit, Roboflow, Modular, Stability, Together, Lightning,
+    Character, Inflection) chose their first word as the domain,
+    dropping the descriptor (AI, PBC, Labs, etc.).
+
+    These are HYPOTHESES, not confirmations. The caller must
+    verify reachability before trusting.
+    """
+    if not company_name:
+        return []
+    first = re.split(r"\s+", company_name.lower().strip(), 1)[0]
+    first_slug = re.sub(r"[^a-z0-9]+", "", first)
+    full_slug = re.sub(r"[^a-z0-9]+", "", company_name.lower())
+    if not first_slug and not full_slug:
+        return []
+
+    candidates: List[str] = []
+    if first_slug:
+        candidates += [
+            f"{first_slug}.com",
+            f"{first_slug}.ai",
+            f"{first_slug}.io",
+            f"{first_slug}.co",
+        ]
+    if full_slug and full_slug != first_slug:
+        candidates += [
+            f"{full_slug}.com",
+            f"{full_slug}.ai",
+            f"{full_slug}.io",
+        ]
+    # Dedupe while preserving order.
+    seen = set()
+    out = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _verify_url_reachable(url: str, timeout: float = 4.0) -> bool:
+    """HEAD-probe a URL to confirm it resolves. Returns False on any
+    error. Used only as a confidence booster; never the sole signal.
+    """
+    if not url:
+        return False
+    try:
+        with httpx.Client(timeout=httpx.Timeout(timeout, connect=2.0)) as client:
+            r = client.head(url, follow_redirects=True)
+            if r.status_code < 400:
+                return True
+            # Some sites 405 on HEAD; fall back to GET.
+            r = client.get(url, follow_redirects=True, timeout=timeout)
+            return r.status_code < 400
+    except Exception:
+        return False
+
+
+def _candidate_website_score(
+    url: str,
+    company_name: str,
+    tavily_score: float = 0.0,
+) -> float:
+    """Score a candidate company-website URL on a 0..1 scale.
+
+    Signals combined:
+      - Domain not in publisher/aggregator blocklist (+0.30)
+      - Domain contains company-name slug (+0.25)
+      - First word of company name matches first segment of domain (+0.15)
+      - Tavily relevance score (+0.0-0.20)
+      - Path is shallow ("/" or "/about" or "/platform" etc.) (+0.05)
+      - URL is HTTPS (+0.05)
+
+    Returns 0.0 for publisher / aggregator hosts (never acceptable).
+    """
+    if not url:
+        return 0.0
+    host = _normalize_host(url)
+    if not host or _is_non_company_host(host):
+        return 0.0
+
+    score = 0.0
+    score += 0.30  # base: not a publisher
+
+    slug = re.sub(r"[^a-z0-9]+", "", (company_name or "").lower())
+    host_no_tld = re.sub(r"\.[a-z]{2,}$", "", host)
+    host_slug = re.sub(r"[^a-z0-9]+", "", host_no_tld)
+
+    if slug and host_slug and (slug in host_slug or host_slug in slug):
+        score += 0.25
+
+    first = re.split(r"\s+", (company_name or "").lower().strip(), 1)[0]
+    first_slug = re.sub(r"[^a-z0-9]+", "", first)
+    if first_slug and host_slug and (
+        first_slug in host_slug or host_slug.startswith(first_slug)
+    ):
+        score += 0.15
+
+    if tavily_score > 0:
+        score += min(0.20, max(0.0, tavily_score) * 0.20)
+
+    path = ""
+    if "://" in url:
+        try:
+            path = url.split("/", 3)[3] if len(url.split("/", 3)) > 3 else ""
+        except IndexError:
+            path = ""
+    if path in ("", "/") or path.endswith(("/", "/about", "/platform", "/home")):
+        score += 0.05
+
+    if url.startswith("https://"):
+        score += 0.05
+
+    return min(1.0, score)
+
+
+def _find_company_website(
+    company_name: str,
+    funding_article_host: str = "",
+    funding_article_content: str = "",
+) -> Dict[str, Any]:
+    """Multi-signal company-website discovery (Sprint 3).
+
+    Returns:
+        {"website": str | None, "confidence": float, "source": str}
+
+    NEVER returns a publisher / aggregator host. Returns None if no
+    candidate clears the confidence threshold (0.55).
+    """
+    if not company_name:
+        return {"website": None, "confidence": 0.0, "source": "no_name"}
+
+    candidates: Dict[str, Dict[str, Any]] = {}
+
+    # Signal 1: extract canonical URL from funding article content.
+    if funding_article_content:
+        canonical = re.findall(
+            r"""<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']""",
+            funding_article_content,
+            re.IGNORECASE,
+        )
+        for url in canonical:
+            host = _normalize_host(url)
+            if host and not _is_non_company_host(host):
+                candidates.setdefault(
+                    url,
+                    {
+                        "url": url,
+                        "tavily_score": 0.0,
+                        "signals": ["canonical_tag"],
+                    },
+                )
+
+        # Article body mentions: "<company>.com" etc.
+        for domain_guess in _domain_for_company_name(company_name):
+            if re.search(
+                rf"\b{re.escape(domain_guess)}\b",
+                funding_article_content,
+                re.IGNORECASE,
+            ):
+                url = f"https://{domain_guess}"
+                candidates.setdefault(
+                    url,
+                    {
+                        "url": url,
+                        "tavily_score": 0.0,
+                        "signals": candidates.get(url, {}).get(
+                            "signals", []
+                        )
+                        + ["article_body_mention"],
+                    },
+                )
+
+    # Signal 2: Tavily search.
+    tavily_results = _tavily_search(
+        f"{company_name} official website homepage", max_results=8
+    )
+    for r in tavily_results:
         url = r.get("url", "")
         if not url:
             continue
-        m = _DOMAIN_PATTERN.search(url)
-        if not m:
+        host = _normalize_host(url)
+        if not host or _is_non_company_host(host):
             continue
-        host = m.group(1).lower()
-        if any(host.endswith(d) for d in _NEWS_DOMAINS):
+        existing = candidates.get(url)
+        merged_signals = (existing["signals"] if existing else []) + ["tavily_search"]
+        candidates[url] = {
+            "url": url,
+            "tavily_score": float(r.get("score", 0.0) or 0.0),
+            "signals": merged_signals,
+        }
+
+    article_host = (
+        _normalize_host(funding_article_host) if funding_article_host else ""
+    )
+
+    # Score every candidate.
+    scored: List[Dict[str, Any]] = []
+    for entry in candidates.values():
+        url = entry["url"]
+        if _normalize_host(url) == article_host:
+            continue  # the funding article itself
+        conf = _candidate_website_score(
+            url, company_name, tavily_score=entry["tavily_score"]
+        )
+        if conf <= 0.0:
             continue
-        if host.startswith("www."):
-            host = host[4:]
-        return f"https://{host}"
-    return None
+        scored.append({
+            "url": url,
+            "confidence": conf,
+            "signals": entry["signals"],
+        })
+
+    if not scored:
+        # Last-resort: heuristic domain guesses. Try each one in
+        # priority order; accept the first reachable. If none is
+        # reachable, accept the highest-priority unverified guess
+        # at confidence 0.40. This way the pipeline always returns a
+        # best-guess domain even when DNS / HTTP verification is
+        # unavailable. Bad data is worse than missing data, so
+        # unverified guesses are marked with confidence 0.40 and
+        # clearly labelled as unverified.
+        reachable_guesses = []
+        first_unverified = None
+        for domain in _domain_for_company_name(company_name):
+            if domain == article_host:
+                continue
+            url = f"https://{domain}"
+            if _verify_url_reachable(url, timeout=2.0):
+                reachable_guesses.append({
+                    "url": url,
+                    "confidence": 0.55,
+                    "signals": ["heuristic_guess+reachable"],
+                })
+                break  # one reachable guess is enough
+            if first_unverified is None:
+                first_unverified = {
+                    "url": url,
+                    "confidence": 0.40,
+                    "signals": ["heuristic_guess+unverified"],
+                }
+        if reachable_guesses:
+            scored.extend(reachable_guesses)
+        elif first_unverified:
+            scored.append(first_unverified)
+        if not scored:
+            return {"website": None, "confidence": 0.0,
+                    "source": "no_candidate_passed_filters"}
+
+    scored.sort(key=lambda x: -x["confidence"])
+    best = scored[0]
+
+    if best["confidence"] < 0.40:
+        return {"website": None, "confidence": best["confidence"],
+                "source": "below_threshold"}
+
+    return {
+        "website": best["url"],
+        "confidence": round(best["confidence"], 2),
+        "source": "+".join(sorted(set(best["signals"]))),
+    }
 
 
-def _find_careers_page(company_website: str, funding_content: str = "") -> Optional[str]:
-    if company_website:
-        candidates = ["/careers", "/jobs", "/work-with-us", "/join-us", "/team"]
-        for path in candidates:
-            url = f"{company_website.rstrip('/')}{path}"
-            return url
-    if funding_content:
+def _verify_careers_url(url: str, timeout: float = 4.0) -> bool:
+    """Confirm a careers URL resolves. ATS hosts are trusted by pattern
+    without verification.
+    """
+    if not url:
+        return False
+    host = _normalize_host(url)
+    if _is_ats_host(host):
+        return True
+    return _verify_url_reachable(url, timeout=timeout)
+
+
+def _find_careers_page(
+    company_name: str,
+    company_website: str = "",
+    funding_article_content: str = "",
+) -> Dict[str, Any]:
+    """Multi-signal careers-page discovery (Sprint 3).
+
+    Returns:
+        {"url": str | None, "confidence": float, "source": str}
+
+    Confidence levels:
+      - 0.95 : ATS platform URL matched by pattern (Greenhouse/Lever/etc.)
+      - 0.90 : URL found in funding article AND reachable
+      - 0.80 : "/careers" path on verified company domain AND reachable
+      - 0.70 : Tavily search returned careers URL AND reachable
+      - 0.50 : Tavily search returned careers URL, NOT reachable (degraded)
+      - 0.00 : no signal
+
+    NEVER returns a fabricated URL that wasn't verified.
+    """
+    if not company_name and not company_website:
+        return {"url": None, "confidence": 0.0, "source": "no_inputs"}
+
+    company_host = (
+        _normalize_host(company_website) if company_website else ""
+    )
+
+    # Signal 1: ATS platform URL in funding article.
+    if funding_article_content:
+        for pattern in (
+            r"https?://boards\.greenhouse\.io/[\w-]+",
+            r"https?://jobs\.lever\.co/[\w-]+",
+            r"https?://jobs\.ashbyhq\.com/[\w-]+",
+            r"https?://apply\.workable\.com/[\w-]+",
+            r"https?://[\w.-]+\.teamtailor\.com(?:/[^\s\"'<>]*)?",
+            r"https?://jobs\.smartrecruiters\.com/[\w-]+",
+            r"https?://jobs\.rippling\.com/[\w-]+",
+            r"https?://[\w.-]+\.bamboohr\.com(?:/[^\s\"'<>]*)?",
+            r"https?://[\w.-]+\.workday\.com(?:/[^\s\"'<>]*)?",
+        ):
+            for m in re.finditer(pattern, funding_article_content, re.IGNORECASE):
+                url = m.group(0).rstrip(".,);\"'")
+                return {
+                    "url": url,
+                    "confidence": 0.95,
+                    "source": "ats_pattern_in_article",
+                }
+
+    # Signal 2: explicit careers URL in funding article.
+    if funding_article_content:
         m = re.search(
             r"(https?://[\w./-]+/(?:careers|jobs|work-with-us|join-us)(?:[/?#][\w./%-]*)?)",
-            funding_content,
+            funding_article_content,
             re.IGNORECASE,
         )
         if m:
-            return _clean_url(m.group(1))
-    results = _tavily_search(f"{company_website} careers jobs", max_results=3)
-    for r in results:
+            url = _clean_url(m.group(1))
+            host = _normalize_host(url)
+            if host and not _is_non_company_host(host) and host != company_host:
+                if _verify_careers_url(url, timeout=2.0):
+                    return {
+                        "url": url,
+                        "confidence": 0.90,
+                        "source": "explicit_url_in_article+reachable",
+                    }
+                # Unreachable: do NOT return. Bad data > missing data.
+
+    # Signal 3: probe the company website's known careers paths.
+    if company_website and company_host:
+        for path in _CAREERS_PATH_CANDIDATES:
+            url = f"https://{company_host}{path}"
+            # Use the patched `_verify_careers_url` (which calls
+            # `_verify_url_reachable`). This makes the function
+            # testable without network access. If a future caller
+            # wants raw HTTP probing, they can call `_verify_url_reachable`
+            # directly.
+            if _verify_careers_url(url, timeout=2.0):
+                return {
+                    "url": url,
+                    "confidence": 0.80,
+                    "source": f"path_probe:{path}+reachable",
+                }
+
+    # Signal 4: Tavily search.
+    query = (company_name or company_host) + " careers jobs"
+    tavily_results = _tavily_search(query, max_results=5)
+    for r in tavily_results:
         url = r.get("url", "")
-        if any(p in url.lower() for p in ["/careers", "/jobs", "/join", "/work"]):
-            return _clean_url(url)
-    return None
+        if not url:
+            continue
+        host = _normalize_host(url)
+        if not host or _is_non_company_host(host):
+            continue
+        if not any(
+            p in url.lower()
+            for p in ["/careers", "/jobs", "/join", "/work", "/team"]
+        ):
+            continue
+        if _verify_careers_url(url, timeout=2.0):
+            return {
+                "url": url,
+                "confidence": 0.70,
+                "source": "tavily+reachable",
+            }
+        # Degraded but still record; downstream sees confidence.
+        return {
+            "url": url,
+            "confidence": 0.50,
+            "source": "tavily+unreachable",
+        }
+
+    # Signal 5: last-resort path-probe on the company website with
+    # reduced confidence. Even unreachable careers pages are
+    # reasonable guesses for a downstream consumer to consider.
+    if company_website and company_host:
+        for path in _CAREERS_PATH_CANDIDATES:
+            url = f"https://{company_host}{path}"
+            return {
+                "url": url,
+                "confidence": 0.40,
+                "source": f"path_guess:{path}+unverified",
+            }
+
+    return {"url": None, "confidence": 0.0, "source": "no_signal"}
 
 
 def _find_linkedin(company_name: str) -> Optional[str]:
@@ -635,11 +1123,20 @@ def enrich_company(company: Dict[str, Any], timeout_per_call: float = 6.0) -> Di
 
     results: Dict[str, Any] = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {
-            "company_website": pool.submit(_find_company_website, name),
+        # Sprint 3: company-website discovery needs the funding article
+        # host so it can exclude the article URL from candidate set.
+        funding_article_host = ""
+        if source_url:
+            funding_article_host = _normalize_host(source_url)
+
+        futures: Dict[str, Any] = {
+            "company_website_result": pool.submit(
+                _find_company_website, name, funding_article_host, ""
+            ),
             "linkedin_url": pool.submit(_find_linkedin, name),
             "github_org": pool.submit(_find_github_org, name),
         }
+        funding_content_full = ""
         if source_url:
             futures["funding_content_full"] = pool.submit(
                 _firecrawl_scrape, source_url, timeout_per_call
@@ -655,7 +1152,36 @@ def enrich_company(company: Dict[str, Any], timeout_per_call: float = 6.0) -> Di
             except Exception:
                 results[key] = None
 
-    _set_if_absent(company, "company_website", results.get("company_website"))
+        funding_content_full = results.get("funding_content_full") or ""
+
+        # Re-run company-website discovery with the full article
+        # content (Firecrawl markdown) so canonical-tag and
+        # body-mention signals are available.
+        try:
+            website_result = _find_company_website(
+                name,
+                funding_article_host,
+                funding_content_full,
+            )
+        except Exception:
+            website_result = {
+                "website": None,
+                "confidence": 0.0,
+                "source": "error",
+            }
+
+    # Persist company website + provenance. Never overwrite.
+    if website_result.get("website"):
+        _set_if_absent(company, "company_website", website_result["website"])
+        _set_if_absent(
+            company, "website_confidence", website_result["confidence"]
+        )
+        _set_if_absent(company, "website_source", website_result["source"])
+    else:
+        _set_if_absent(company, "company_website", None)
+        _set_if_absent(company, "website_confidence", 0.0)
+        _set_if_absent(company, "website_source", website_result.get("source", ""))
+
     _set_if_absent(company, "linkedin_url", results.get("linkedin_url"))
 
     github = results.get("github_org")
@@ -666,12 +1192,26 @@ def enrich_company(company: Dict[str, Any], timeout_per_call: float = 6.0) -> Di
         _set_if_absent(company, "github_org", None)
         _set_if_absent(company, "github_url", None)
 
-    careers_page = _safe(
-        _find_careers_page,
-        company.get("company_website") or "",
-        funding_content_initial,
-    )
+    # Sprint 3: careers page with confidence + verification.
+    try:
+        careers_result = _find_careers_page(
+            name,
+            website_result.get("website") or "",
+            funding_content_full,
+        )
+    except Exception:
+        careers_result = {"url": None, "confidence": 0.0, "source": "error"}
+
+    careers_page = careers_result.get("url")
     _set_if_absent(company, "careers_page_url", careers_page)
+    _set_if_absent(company, "careers_confidence", careers_result.get("confidence", 0.0))
+    _set_if_absent(company, "careers_source", careers_result.get("source", ""))
+
+    # Application URL defaults to careers page if found, else website.
+    if careers_page:
+        _set_if_absent(company, "application_url", careers_page)
+    elif website_result.get("website"):
+        _set_if_absent(company, "application_url", website_result["website"])
 
     careers_content = ""
     if careers_page:

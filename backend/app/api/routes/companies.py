@@ -654,24 +654,15 @@ async def list_companies(
         "has_resume": has_resume,
     }
 
+    # Sprint 4 B3 fix: the duplicate return block below is unreachable
+    # (the `return` above exits the function). The dead code has been
+    # removed; per-company `recommendation` is already attached inside
+    # the loop via `career_intelligence.generate_recommendation`.
+
     # Career Intelligence summary: aggregates per-company
     # recommendations for dashboard-level view.
-    from app.services.career_intelligence import aggregate_recommendation_metrics
-    paginated_with_recs = [c for c in paginated if c.get("recommendation")]
-    summary = aggregate_recommendation_metrics(
-        paginated_with_recs, candidate
-    )
-    return {
-        "companies": paginated,
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "pages": (total + limit - 1) // limit,
-        "has_next": offset + limit < total,
-        "has_previous": page > 1,
-        "has_resume": has_resume,
-        "recommendation_summary": summary,
-    }
+    # NOTE (Sprint 4): this code is unreachable. Removed for clarity.
+    # The per-company `recommendation` field is already attached above.
 
 
 @router.get("/{company_name}")

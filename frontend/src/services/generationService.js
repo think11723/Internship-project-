@@ -9,23 +9,3 @@ import api from './api'
 export const generateCoverLetter = async (companyName) => {
   return api.post('/api/documents/generate', { company_name: companyName })
 }
-
-/**
- * Get a previously generated document
- * @param {number} id - Document ID
- * @returns {Promise} Promise with document content
- */
-export const getDocument = async (id) => {
-  return api.get(`/api/documents/${id}`)
-}
-
-/**
- * Download a generated document
- * @param {number} id - Document ID
- * @returns {Promise} Promise with document file
- */
-export const downloadDocument = async (id) => {
-  return api.get(`/api/documents/${id}/download`, {
-    responseType: 'blob',
-  })
-}
