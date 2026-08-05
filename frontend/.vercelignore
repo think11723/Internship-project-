@@ -1,0 +1,9 @@
+# Don't drag dev-only files into the Vercel deployment.
+# https://vercel.com/docs/concepts/monorepos/ignoring-monorepos
+node_modules/
+dist/
+.env
+.env.local
+*.log
+test.pdf
+.DS_Store

@@ -5,15 +5,22 @@ This is the entry point for the FastAPI backend application.
 """
 
 import threading
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.config import settings
+
+from app.core.config import settings, validate_settings
 from app.core.logging import setup_logging
 from app.core.exceptions import setup_exception_handlers
 from app.core.middleware import ValidationMiddleware
 from app.db.session import engine, Base
 from app.api.routes import health, resume, companies, documents, workflow
+
+# Fail fast if required environment variables are missing. This runs
+# *before* the FastAPI app is constructed so the failure is loud and
+# immediate rather than a confusing 500 on the first request.
+validate_settings()
 
 # Setup logging
 logger = setup_logging()
@@ -87,7 +94,7 @@ def _migrate_existing_schema() -> None:
     add new columns to existing ones. This is a no-op on every startup
     once the migration has run.
     """
-    expected: Dict[str, str] = {
+    expected: dict[str, str] = {
         "file_size": "INTEGER",
     }
     try:
@@ -113,11 +120,19 @@ async def shutdown_event():
 
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
+
+    # ``reload`` enables the file-watcher hot-reload. In production this
+    # massively hurts performance and exposes internal endpoints on every
+    # file save. Auto-disable outside development.
+    is_dev = os.getenv("ENVIRONMENT", "development") == "development"
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True,
+        port=int(os.getenv("PORT", "8000")),
+        reload=is_dev,
+        log_level="debug" if is_dev else "info",
     )

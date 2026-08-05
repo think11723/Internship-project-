@@ -1,0 +1,73 @@
+# ─────────────  Environment & secrets  ─────────────
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+
+# ─────────────  Python  ─────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+backend/venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─────────────  Node  ─────────────
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.cache/
+frontend/coverage/
+frontend/screenshots/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ─────────────  Logs  ─────────────
+*.log
+backend.log
+backend/backend.log
+frontend/frontend.log
+logs/
+backend/logs/
+
+# ─────────────  Local artifacts  ─────────────
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/cache/
+*.sqlite
+*.sqlite3
+*.db
+backend/fundflow.db
+backend/__pycache__/
+backend/app/__pycache__/
+backend/app/*/__pycache__/
+
+# ─────────────  OS / editor  ─────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─────────────  Claude / dev tooling  ─────────────
+.claude/
+.devin/
+
+# ─────────────  Coverage / reports  ─────────────
+coverage/
+*.lcov
+.nyc_output/
+
+# ─────────────  Build outputs  ─────────────
+dist/
+build/
+*.tsbuildinfo

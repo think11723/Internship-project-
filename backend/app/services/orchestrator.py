@@ -8,6 +8,7 @@ Demo Data fallback when discovery is unavailable.
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,14 +24,19 @@ from app.services.intelligence import career_intelligence, market_intelligence
 logger = logging.getLogger("fundflow")
 
 _SEED_PATH = Path(__file__).resolve().parent.parent / "data" / "seed_companies.json"
-_CACHE_PATH = Path(__file__).resolve().parent.parent / "cache" / "latest_discovery.json"
+_CACHE_DIR = Path(os.environ.get("FUNDFLOW_DATA_DIR", Path(__file__).resolve().parent.parent)) / "cache"
+# Backwards-compat: if the env var isn't set, fall back to the historical
+# location (next to the app/ folder). Production deployments should set
+# FUNDFLOW_DATA_DIR to a persistent volume path.
+_CACHE_PATH = _CACHE_DIR / "latest_discovery.json"
 
 
-def _simulate_stage(name: str, duration: float) -> None:
-    """Log workflow stage progress.
+def _log_stage(name: str, duration: float) -> None:
+    """Log a workflow stage boundary. No side effect beyond logging.
 
-    NOTE: time.sleep() removed for production. Stage delays were previously
-    used for UX simulation. In production, stages execute synchronously.
+    Kept for observability — operators can grep the log for stage
+    boundaries to reconstruct timing. The ``duration`` argument is the
+    cumulative elapsed time at the point this stage completed.
     """
     logger.info("[Workflow] %s (%.2fs)", name, duration)
 
@@ -357,7 +363,7 @@ def run_weekly_report(db: Session) -> Dict[str, Any]:
         - {requires_resume: True, message}
     """
     # ---------- Stage 1: Resume Intelligence ----------
-    _simulate_stage("Reading Resume", 0.3)
+    _log_stage("Reading Resume", 0.3)
     latest_resume: Optional[Resume] = (
         db.query(Resume).order_by(Resume.parsed_at.desc()).first()
     )
@@ -368,22 +374,22 @@ def run_weekly_report(db: Session) -> Dict[str, Any]:
             "message": "Please upload your resume first.",
         }
 
-    _simulate_stage("Understanding Candidate Profile", 0.3)
+    _log_stage("Understanding Candidate Profile", 0.3)
     candidate = _build_candidate(latest_resume)
 
     # ---------- Stage 2: Market Intelligence ----------
-    _simulate_stage("Discovering High-Growth AI Companies", 0.4)
+    _log_stage("Discovering High-Growth AI Companies", 0.4)
     companies = _load_companies()
     market = market_intelligence(companies)
     market_summary = market["market_summary"]
     industry_breakdown = market["industry_breakdown"]
 
     # ---------- Stage 3: Company Intelligence ----------
-    _simulate_stage("Matching Skills", 0.3)
+    _log_stage("Matching Skills", 0.3)
     top_matches = _select_top_matches(companies, candidate["skills"])
 
     # ---------- Stage 4: Career Intelligence ----------
-    _simulate_stage("Ranking Opportunities", 0.3)
+    _log_stage("Ranking Opportunities", 0.3)
     career = career_intelligence(candidate, companies, top_matches)
     career_intelligence_block = career["career_intelligence"]
     technology_breakdown = career["technology_breakdown"]
@@ -394,12 +400,12 @@ def run_weekly_report(db: Session) -> Dict[str, Any]:
     # top_matches is already sorted by score desc + name asc.
 
     # ---------- Stage 6: Report Assembly ----------
-    _simulate_stage("Generating Cover Letter", 0.4)
+    _log_stage("Generating Cover Letter", 0.4)
     cover_letter = None
     if top_matches:
         cover_letter = generate_cover_letter(candidate, top_matches[0])
 
-    _simulate_stage("Preparing Weekly Career Report", 0.4)
+    _log_stage("Preparing Weekly Career Report", 0.4)
 
     name = candidate.get("name") or ""
     if name:

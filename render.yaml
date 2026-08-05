@@ -1,0 +1,55 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# This file lets you spin up the entire backend stack (web service +
+# persistent disk) in one click via the Render dashboard.
+#
+# Before applying: set OPENROUTER_API_KEY (and optionally TAVILY_API_KEY,
+# FIRECRAWL_KEY) as Render "Secret Files" env vars. Set ALLOWED_ORIGINS
+# to your deployed Vercel origin.
+#
+# After applying: Render auto-detects the blueprint, creates the service
+# and disk, and runs `pip install -r requirements.txt` followed by
+# `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+
+services:
+  - type: web
+    name: fundflow-backend
+    runtime: python
+    plan: starter
+    rootDir: backend
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: FUNDFLOW_DATA_DIR
+        value: /data
+      - key: DATABASE_URL
+        value: sqlite:////data/fundflow.db
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: OPENROUTER_MODEL
+        value: anthropic/claude-3.5-sonnet
+      - key: DISCOVERY_CACHE_HOURS
+        value: 24
+      # ─── REQUIRED secrets — set these in the Render dashboard BEFORE deploying ───
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        # ← Replace with your Vercel origin, e.g.
+        #   ["https://fundflow-ai.vercel.app"]
+        value: "[\"https://example.com\"]"
+      # ─── OPTIONAL secrets ───
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: FIRECRAWL_API_KEY
+        sync: false
+    disk:
+      name: fundflow-data
+      mountPath: /data
+      sizeGB: 1

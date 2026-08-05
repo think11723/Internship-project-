@@ -26,8 +26,13 @@ router = APIRouter()
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_MIME_TYPES = {"application/pdf"}
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Uploads directory: configurable via ``FUNDFLOW_DATA_DIR`` env var
+# so deployments can mount a persistent volume (e.g. ``/data``).
+# In dev / local Docker the variable is unset and uploads land in
+# ``./uploads`` next to the database file.
+UPLOAD_DIR = Path(os.environ.get("FUNDFLOW_DATA_DIR", ".")) / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # In-memory job registry for upload progress.
