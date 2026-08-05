@@ -4,7 +4,9 @@ FundFlow AI - Main Application Entry Point
 This is the entry point for the FastAPI backend application.
 """
 
+import os
 import threading
+import time
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -60,18 +62,130 @@ app.include_router(workflow.router, prefix="/api/workflow", tags=["Workflow"])
 def _prewarm_discovery_cache() -> None:
     """Pre-warm the discovery cache in a background thread.
 
-    Runs ``_load_companies`` once so the first user request to
-    ``/api/companies`` or the orchestrator hits a warm cache instead
-    of paying the discovery latency on the hot path. Failures are
-    non-fatal — the cache fallback (now caching the seed on failure)
-    ensures the next request is still fast.
+    Uses the deterministic Tavily pipeline (``trigger_weekly_refresh``)
+    so the prewarm does not silently degrade to the curated seed when
+    the LLM is unavailable. If Tavily itself fails, the cache stays
+    empty and the first real request will trigger discovery lazily.
     """
     try:
-        from app.services.orchestrator import _load_companies
-        companies = _load_companies()
-        logger.info("Pre-warmed discovery cache with %d companies", len(companies))
+        from app.services.orchestrator import trigger_weekly_refresh
+        result = trigger_weekly_refresh(force=False)
+        if result.get("status") == "ok":
+            logger.info(
+                "Pre-warmed discovery cache: %s companies=%s",
+                result.get("status"),
+                result.get("companies_count"),
+            )
+        else:
+            logger.info(
+                "Pre-warm discovery cache: status=%s",
+                result.get("status"),
+            )
     except Exception as exc:
         logger.warning("Pre-warm discovery cache failed: %s", exc)
+
+
+def _scheduler_loop(stop_event: threading.Event, interval_seconds: float) -> None:
+    """Run the Weekly Funding Agent every ``interval_seconds`` seconds.
+
+    Uses a ``threading.Event`` for clean shutdown so a future
+    FastAPI lifespan migration can ``stop_event.set()`` and the loop
+    will exit promptly on its next ``wait`` timeout.
+    """
+    while not stop_event.is_set():
+        # Sleep first — the prewarm already covers the cold start.
+        if stop_event.wait(timeout=interval_seconds):
+            return
+        try:
+            from app.services.orchestrator import trigger_weekly_refresh
+            result = trigger_weekly_refresh(force=False)
+            logger.info(
+                "Weekly scheduler tick: status=%s companies=%s",
+                result.get("status"),
+                result.get("companies_count"),
+            )
+            # Non-blocking enrichment after discovery. Runs in its
+            # own daemon thread so the request path is never blocked.
+            if result.get("status") in {"ok", "skipped"}:
+                threading.Thread(
+                    target=_enrichment_tick,
+                    daemon=True,
+                    name="company-enrichment-tick",
+                ).start()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Weekly scheduler tick failed: %s", exc)
+
+
+def _enrichment_tick() -> None:
+    """Run the Company Intelligence enrichment pass once.
+
+    Pure-deterministic — no LLM dependency. Reads the cache populated
+    by the Weekly Funding Agent and adds richer per-company fields
+    (careers page URL, LinkedIn, GitHub, founders, investors, tech
+    stack, hiring signals, etc.). Existing populated fields are
+    never overwritten. Errors per-company are logged but do not
+    propagate.
+    """
+    try:
+        from app.services.company_enricher import run_enrichment
+        result = run_enrichment(force=False)
+        logger.info(
+            "Enrichment tick complete: enriched=%s skipped=%s total=%s",
+            result.get("enriched"),
+            result.get("skipped"),
+            result.get("total"),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Enrichment tick failed: %s", exc)
+
+
+def _start_weekly_scheduler() -> None:
+    """Start the weekly funding scheduler, gated by env flags.
+
+    - ``WEEKLY_AGENT_ENABLED=false`` → no-op (keeps the deployment
+      identical to the pre-agent behaviour).
+    - ``WEEKLY_AGENT_RUN_ONCE=true`` (intended for CI / one-shot
+      local verification) → runs the agent synchronously once on
+      startup and does NOT spawn a thread. The next startup or
+      POST ``/api/companies/refresh-weekly?force=true`` covers
+      subsequent runs.
+    - Otherwise → spawn a daemon thread that ticks every
+      ``WEEKLY_AGENT_INTERVAL_HOURS``.
+    """
+    if not settings.WEEKLY_AGENT_ENABLED:
+        logger.info("Weekly scheduler disabled (WEEKLY_AGENT_ENABLED=false)")
+        return
+
+    interval_seconds = settings.WEEKLY_AGENT_INTERVAL_HOURS * 3600
+
+    if settings.WEEKLY_AGENT_RUN_ONCE:
+        logger.info(
+            "Weekly agent RUN_ONCE=true — running synchronously on startup"
+        )
+        try:
+            from app.services.orchestrator import trigger_weekly_refresh
+            result = trigger_weekly_refresh(force=True)
+            logger.info(
+                "Weekly agent run-once complete: status=%s companies=%s",
+                result.get("status"),
+                result.get("companies_count"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Weekly agent run-once failed: %s", exc)
+        return
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_scheduler_loop,
+        args=(stop_event, interval_seconds),
+        daemon=True,
+        name="weekly-funding-agent-scheduler",
+    )
+    thread.start()
+    logger.info(
+        "Weekly scheduler started (interval=%sh, daemon thread)",
+        settings.WEEKLY_AGENT_INTERVAL_HOURS,
+    )
 
 
 @app.on_event("startup")
@@ -85,6 +199,9 @@ async def startup_event():
     logger.info("Database initialized successfully")
     # Fire-and-forget background pre-warm; does not block startup.
     threading.Thread(target=_prewarm_discovery_cache, daemon=True).start()
+    # Weekly funding scheduler — same pattern; can be disabled via
+    # ``WEEKLY_AGENT_ENABLED=false`` (default true).
+    _start_weekly_scheduler()
 
 
 def _migrate_existing_schema() -> None:

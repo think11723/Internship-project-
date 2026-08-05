@@ -32,6 +32,18 @@ SEARCH_QUERIES = [
     "enterprise AI startups",
 ]
 
+# Queries used by the Weekly Funding Agent. Tightened to surface news
+# specifically from the last 7 days; server-side date filtering in the
+# Tavily call itself (``start_date`` / ``end_date``) further narrows
+# the result set before the LLM ever sees anything.
+WEEKLY_SEARCH_QUERIES = [
+    "AI startups raised funding last week",
+    "AI startup Series A last week",
+    "AI startup Series B last week",
+    "seed round AI startup last week",
+    "weekly AI funding news",
+]
+
 SEARCH_DOMAINS = [
     "techcrunch.com",
     "crunchbase.com",
@@ -262,6 +274,176 @@ def _build_normalize_prompt(scraped: List[Dict[str, Any]]) -> str:
         "}\n\n"
         "REQUIREMENTS:\n"
         "- Return 10-20 high-quality, RECENT funding events (last ~6 months).\n"
+        "- Focus on AI, developer tools, infrastructure, enterprise AI, robotics.\n"
+        "- Deduplicate across sources.\n"
+        "- Unknown fields use empty string, never invent.\n"
+        "- Skills must be concrete technologies a candidate would actually list.\n\n"
+        f"SCRAPED SOURCES:\n{sources}"
+    )
+
+
+def _tavily_search_for_window(
+    window_start: str, window_end: str, queries: List[str]
+) -> List[Dict[str, Any]]:
+    """Tavily search for funding events in ``[window_start, window_end]``.
+
+    Adds server-side ``start_date`` and ``end_date`` parameters to each
+    Tavily query so the result set is date-narrowed before the LLM
+    ever sees anything. Reuses the same dedup + ThreadPoolExecutor
+    pattern as ``_tavily_search`` but with a different query set.
+
+    Each Tavily result includes ``published_date`` (RFC 2822), which
+    the deterministic extractor uses as the freshness timestamp.
+
+    Raises on unrecoverable failure; returns ``[]`` on per-query failure
+    so the caller's post-filter still has a chance to find something.
+    """
+    aggregated: List[Dict[str, Any]] = []
+    seen_urls: set = set()
+
+    def _fetch(query: str) -> List[Dict[str, Any]]:
+        try:
+            with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+                response = client.post(
+                    "https://api.tavily.com/search",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {settings.TAVILY_API_KEY}",
+                    },
+                    json={
+                        "query": query,
+                        "max_results": 8,
+                        "include_domains": SEARCH_DOMAINS,
+                        "topic": "news",
+                        "start_date": window_start,
+                        "end_date": window_end,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            logger.warning("Tavily query '%s' failed: %s", query, exc)
+            return []
+        results = []
+        for result in data.get("results", []):
+            url = result.get("url")
+            if url:
+                results.append(
+                    {
+                        "url": url,
+                        "title": result.get("title", ""),
+                        "content": result.get("content", ""),
+                        "raw_content": result.get("raw_content"),
+                        "published_date": result.get("published_date", ""),
+                        "score": result.get("score", 0.0),
+                    }
+                )
+        return results
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        for batch in pool.map(_fetch, queries):
+            for result in batch:
+                url = result.get("url")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                aggregated.append(result)
+
+    logger.info(
+        "Tavily returned %d unique URLs for window %s..%s",
+        len(aggregated),
+        window_start,
+        window_end,
+    )
+    return aggregated
+
+
+def _openai_normalize_last_week(
+    scraped: List[Dict[str, Any]], window_start: str, window_end: str
+) -> List[Dict[str, Any]]:
+    """Normalize scraped pages into the company schema, with an
+    explicit "last week" anchor in the LLM prompt.
+
+    Same shape contract as ``_openai_normalize``. Reuses the existing
+    LLMService and the same ``gpt-4.1-mini`` model. The date window
+    is repeated in the prompt so the LLM has a hard constraint, not
+    just a hint.
+    """
+    llm = LLMService()
+    prompt = _build_normalize_prompt_last_week(scraped, window_start, window_end)
+
+    response = llm.client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a startup intelligence analyst who extracts "
+                    "structured data about recently funded AI startups."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = ""
+    if getattr(response, "choices", None):
+        for choice in response.choices:
+            message = getattr(choice, "message", None)
+            if message is not None and getattr(message, "content", None):
+                content = message.content
+                break
+
+    if not content:
+        raise RuntimeError("OpenAI returned empty normalization payload")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenAI returned invalid JSON: {exc}") from exc
+
+    companies = parsed.get("companies", [])
+    if not isinstance(companies, list):
+        raise RuntimeError("OpenAI payload missing 'companies' array")
+
+    return [_normalize_company_shape(c) for c in companies]
+
+
+def _build_normalize_prompt_last_week(
+    scraped: List[Dict[str, Any]], window_start: str, window_end: str
+) -> str:
+    """Same shape as ``_build_normalize_prompt`` but with an explicit
+    "funding between window_start and window_end" REQUIREMENTS line.
+    """
+    sources = "\n\n".join(
+        f"SOURCE: {item['url']}\n{item['markdown']}" for item in scraped
+    )
+    return (
+        "Extract structured information about AI / tech startups that "
+        "announced a funding round in the last week.\n\n"
+        "Return ONLY valid JSON in this exact shape:\n"
+        "{\n"
+        '  "companies": [\n'
+        "    {\n"
+        '      "name": "Company Name",\n'
+        '      "tagline": "One sentence (max 15 words)",\n'
+        '      "industry": "e.g. AI Search, Developer Tools, Enterprise AI",\n'
+        '      "headquarters": "City, Country",\n'
+        '      "funding_round": "Series A / Series B / Seed / etc",\n'
+        '      "funding_amount": "$XXM or $XXB (amount only)",\n'
+        '      "founded": "YYYY or empty",\n'
+        '      "career_page": "company.com/careers or jobs.company.com",\n'
+        '      "website": "company.com",\n'
+        '      "why_hot": "1-2 sentences on why interesting right now",\n'
+        '      "skills": ["Python", "PyTorch", "AWS", ...] (5-8 skills)\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "REQUIREMENTS:\n"
+        f"- ONLY include companies that announced a funding round "
+        f"BETWEEN {window_start} AND {window_end} (inclusive).\n"
+        "- EXCLUDE any company whose only mention is from an older article.\n"
         "- Focus on AI, developer tools, infrastructure, enterprise AI, robotics.\n"
         "- Deduplicate across sources.\n"
         "- Unknown fields use empty string, never invent.\n"

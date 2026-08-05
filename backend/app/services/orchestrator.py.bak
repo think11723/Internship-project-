@@ -81,46 +81,15 @@ def _read_cache() -> Optional[Dict[str, Any]]:
 
 
 def _write_cache(companies: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Persist discovered companies to the cache file with metadata.
-
-    Always writes a dict envelope so the cache can carry
-    cross-cutting fields (recommendations_resume_id,
-    recommendations_generated_at, etc.) alongside the company list.
-    Reads any existing envelope to preserve those fields across
-    discovery overwrites.
-    """
+    """Persist discovered companies to the cache file with metadata."""
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existing: Dict[str, Any] = {}
-        try:
-            with open(_CACHE_PATH, "r", encoding="utf-8") as f:
-                prior = json.load(f)
-            if isinstance(prior, dict):
-                existing = prior
-        except Exception:
-            existing = {}
-        envelope = {
-            "companies": companies,
-            "metadata": {
-                **existing.get("metadata", {}),
-                "cache_hit": False,
-                "cached_at": time.time(),
-                "cached_at_human": time.ctime(_CACHE_PATH.stat().st_mtime),
-                "cache_path": str(_CACHE_PATH),
-                "companies_count": len(companies),
-            },
-        }
-        # Preserve Career Intelligence metadata if present.
-        for key in ("recommendations_resume_id",
-                     "recommendations_generated_at"):
-            if key in existing and key not in envelope:
-                envelope[key] = existing[key]
         with open(_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(envelope, f, indent=2)
+            json.dump(companies, f, indent=2)
         logger.info("Cached %d discovered companies", len(companies))
         return {
             "cache_hit": False,
-            "cached_at": envelope["metadata"]["cached_at_human"],
+            "cached_at": time.ctime(_CACHE_PATH.stat().st_mtime),
             "cache_path": str(_CACHE_PATH),
             "companies_count": len(companies),
         }

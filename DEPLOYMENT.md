@@ -254,6 +254,33 @@ FUNDFLOW_DATA_DIR=/data
 
 (Requires updating the path constants in `backend/app/api/routes/resume.py` and `backend/app/services/orchestrator.py` to read from `FUNDFLOW_DATA_DIR` — see the Render section above for the small startup helper.)
 
+### How the weekly company refresh works
+
+```
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────────┐
+│  background      │    │  cache file      │    │  existing API       │
+│  scheduler       │───►│  latest_         │───►│  /api/companies*    │
+│  (main.py)       │    │  discovery.json  │    │  (unchanged)        │
+└──────────────────┘    └──────────────────┘    └──────────────────────┘
+        │                      ▲                          ▲
+        │  Tavily+Firecrawl    │                          │
+        │  +OpenRouter         │                          │
+        └──────────────────────┘                          │
+           (every WEEKLY_AGENT_INTERVAL_HOURS)             │
+                                                          │
+                                              ┌──────────────────────┐
+                                              │  frontend (no change)│
+                                              └──────────────────────┘
+```
+
+- A daemon thread started in `main.py`'s `startup_event` calls `run_weekly_refresh()` every `WEEKLY_AGENT_INTERVAL_HOURS` (default 7 days).
+- The agent queries Tavily for the last `WEEKLY_AGENT_LOOKBACK_DAYS` (default 7), scrapes the results with Firecrawl, and asks the LLM to extract companies funded **specifically within that window**.
+- Result is written to `cache/latest_discovery.json`. The existing API reads from this same file — no contract change.
+- On any failure (missing keys, rate limit, LLM down) the agent writes the curated seed to the cache so the page is never empty.
+- To trigger a refresh manually: `POST /api/companies/refresh-weekly?force=true` (no auth, intended for trusted internal use).
+- Set `WEEKLY_AGENT_ENABLED=false` to disable the scheduler entirely (the prewarm on startup will still run live discovery once if the cache is older than `DISCOVERY_CACHE_HOURS`).
+- Set `WEEKLY_AGENT_RUN_ONCE=true` in CI to run the agent synchronously on startup and exit.
+
 ---
 
 ## Common deployment issues

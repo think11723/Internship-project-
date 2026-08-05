@@ -75,6 +75,18 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = False
 
+    # ── Weekly Funding Agent ────────────────────────────────────────────
+    # When enabled, a background scheduler in main.py runs the agent
+    # every ``WEEKLY_AGENT_INTERVAL_HOURS`` hours, scraping the last
+    # ``WEEKLY_AGENT_LOOKBACK_DAYS`` days of funded AI startups into
+    # the discovery cache. Set ``WEEKLY_AGENT_RUN_ONCE=true`` in CI
+    # (or for one-shot local verification) to trigger a synchronous
+    # refresh instead of starting the scheduler thread.
+    WEEKLY_AGENT_ENABLED: bool = True
+    WEEKLY_AGENT_INTERVAL_HOURS: int = 168  # 7 days
+    WEEKLY_AGENT_LOOKBACK_DAYS: int = 7
+    WEEKLY_AGENT_RUN_ONCE: bool = False
+
     class Config:
         env_file = ".env"
         case_sensitive = True

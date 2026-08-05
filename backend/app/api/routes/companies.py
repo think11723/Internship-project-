@@ -116,6 +116,37 @@ async def discover_companies(payload: DiscoverRequest):
     )
 
 
+@router.post("/refresh-weekly")
+async def refresh_weekly(force: bool = Query(False)):
+    """Manually trigger the Weekly Funding Agent.
+
+    Calls the same code path the background scheduler uses every
+    ``settings.WEEKLY_AGENT_INTERVAL_HOURS`` hours. Returns the
+    same envelope the scheduler logs:
+    ``{status, companies_count, window?, fell_back_to_seed?, cached_at, error?}``.
+
+    ``force=true`` bypasses the cache-freshness check and always runs.
+    """
+    from app.services.orchestrator import trigger_weekly_refresh
+
+    return trigger_weekly_refresh(force=force)
+
+
+@router.post("/enrich")
+async def enrich_companies(force: bool = Query(False)):
+    """Manually trigger the Company Intelligence enrichment pass.
+
+    Reads the cache populated by the Weekly Funding Agent and adds
+    richer per-company fields (company website, LinkedIn, GitHub,
+    careers page, founders, investors, tech stack, hiring signals,
+    etc.). Pure-deterministic — no LLM dependency. Existing populated
+    fields are never overwritten.
+    """
+    from app.services.company_enricher import run_enrichment
+
+    return run_enrichment(force=force)
+
+
 @router.post("/match", response_model=MatchResponse)
 async def match_companies(payload: MatchRequest, db: Session = Depends(get_db)):
     """
@@ -539,6 +570,18 @@ async def list_companies(
             "matching_skills": [],
             "short_description": company.get("tagline", ""),
             "why_match": "Upload a resume to see your personalized match.",
+            # Propagate ALL enrichment fields from the cache record.
+            # The enrichment module writes additive fields only;
+            # this spread keeps them visible to the frontend.
+            **{k: v for k, v in company.items()
+               if k not in (
+                   "id", "name", "logo", "industry", "headquarters",
+                   "funding_stage", "funding_amount", "founded",
+                   "career_page", "website", "why_hot", "skills",
+                   "tagline", "match_score", "matching_skills",
+                   "why_match", "short_description", "company_size",
+                   "hiring_status",
+               )},
         }
 
         if candidate:
@@ -556,6 +599,14 @@ async def list_companies(
             item["match_score"] = result["score"]
             item["matching_skills"] = matching_skills
             item["why_match"] = _build_reason(result["overlap"], company)
+
+        # Career Intelligence Engine: deterministic per-company
+        # recommendation. Pure-deterministic, no LLM dependency.
+        # Always runs (even without a resume — the engine returns a
+        # "Upload your resume to get a personalized recommendation"
+        # payload). Additive only — never mutates existing item fields.
+        from app.services.career_intelligence import generate_recommendation
+        item["recommendation"] = generate_recommendation(company, candidate)
 
         scored.append(item)
 
@@ -601,6 +652,25 @@ async def list_companies(
         "has_next": offset + limit < total,
         "has_previous": page > 1,
         "has_resume": has_resume,
+    }
+
+    # Career Intelligence summary: aggregates per-company
+    # recommendations for dashboard-level view.
+    from app.services.career_intelligence import aggregate_recommendation_metrics
+    paginated_with_recs = [c for c in paginated if c.get("recommendation")]
+    summary = aggregate_recommendation_metrics(
+        paginated_with_recs, candidate
+    )
+    return {
+        "companies": paginated,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "pages": (total + limit - 1) // limit,
+        "has_next": offset + limit < total,
+        "has_previous": page > 1,
+        "has_resume": has_resume,
+        "recommendation_summary": summary,
     }
 
 

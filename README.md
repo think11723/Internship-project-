@@ -17,7 +17,8 @@
 |---|---|
 | 📄 **Resume Upload** | Drag-drop or click to upload a PDF. 10 MB max, MIME-checked, sanitized filename. |
 | 🤖 **Resume Intelligence** | AI extracts a 19-field rich profile (skills, technologies, recommended roles, experience, education). |
-| 🔍 **Company Discovery** | Curated dataset of 20 funded AI startups with funding rounds, industry tags, headquarters, careers page. |
+| 🔍 **Weekly Funding Agent** | Background scheduler scrapes the last 7 days of funded AI startups (Tavily + Firecrawl + OpenRouter) and rewrites the discovery cache. Falls back to curated seed if external services fail. |
+| 🏢 **Company Discovery** | Live cache of recently funded AI startups with funding rounds, industry tags, headquarters, careers page. Falls back to a curated 20-company seed when the cache is unavailable. |
 | 🎯 **AI Matching** | Deterministic overlap scoring per company — explains *why* a company matches. |
 | 📊 **Weekly Career Report** | Six-stage orchestrator produces a complete dashboard: market intelligence, top opportunities, insights, career intelligence, cover letter. |
 | ✍️ **AI Cover Letter** | One-click personalized cover letter for the top match — written in the candidate's voice. |
@@ -152,6 +153,10 @@ Frontend serves on `http://localhost:3000`. The Vite dev server proxies `/api/*`
 | `TAVILY_API_KEY` | ❌ | Tavily key (live company discovery) | empty → uses seed |
 | `FIRECRAWL_API_KEY` | ❌ | Firecrawl key (live company scraping) | empty → uses seed |
 | `DISCOVERY_CACHE_HOURS` | ❌ | Cache TTL | `24` |
+| `WEEKLY_AGENT_ENABLED` | ❌ | Master switch for the weekly background scheduler | `true` |
+| `WEEKLY_AGENT_INTERVAL_HOURS` | ❌ | How often the agent runs (background thread) | `168` (7 days) |
+| `WEEKLY_AGENT_LOOKBACK_DAYS` | ❌ | Tavily date-window size | `7` |
+| `WEEKLY_AGENT_RUN_ONCE` | ❌ | Run once on startup then exit (intended for CI) | `false` |
 | `ALLOWED_ORIGINS` | ❌ | CORS allow-list (JSON array) | localhost 3000–3010, 5173 |
 | `ENVIRONMENT` | ❌ | `development` / `production` | `development` |
 | `DEBUG` | ❌ | SQL echo, verbose logs | `false` |
