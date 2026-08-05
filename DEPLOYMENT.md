@@ -11,8 +11,8 @@ This document covers how to deploy FundFlow AI to production. The application is
 3. [Environment variables](#environment-variables)
 4. [Frontend on Vercel](#frontend-on-vercel)
 5. [Frontend on Netlify](#frontend-on-netlify)
-6. [Backend on Render](#backend-on-render)
-7. [Backend on Railway](#backend-on-railway)
+6. [Backend on Railway](#backend-on-railway) — **primary target**
+7. [Backend on Render](#backend-on-render) — alternative
 8. [Docker](#docker)
 9. [Persistent storage](#persistent-storage)
 10. [Common deployment issues](#common-deployment-issues)
@@ -124,56 +124,55 @@ For SPA routing (so direct URL loads work), add a `_redirects` file in `frontend
 
 ---
 
-## Backend on Render
+## Backend on Railway — **primary target**
 
-1. **Sign in** to <https://render.com> and click **New → Web Service**.
-2. Connect the GitHub repo.
-3. Configure:
-   - **Root Directory:** `backend`
-   - **Environment:** `Python 3`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
-   - **Plan:** Starter (or higher for production)
-4. Add environment variables (see [Environment variables](#environment-variables) above).
-5. **Add a persistent disk**:
-   - In the dashboard, go to **Disks → Add Disk**.
+The backend is pre-configured for Railway via `railway.json` at the repo root. Railway auto-detects the Dockerfile in `backend/`, builds the image, runs the start command, and mounts a persistent volume for SQLite + uploads + cache.
+
+### Deploy steps
+
+1. **Sign in** to <https://railway.app> and click **New Project → Deploy from GitHub**.
+2. Select the `fundflow-ai` repository.
+3. Railway reads `railway.json` from the repo root. It will:
+   - Use `backend/Dockerfile` as the build context.
+   - Run `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1` as the start command.
+   - Create a persistent volume named `fundflow-data` mounted at `/data`.
+   - Set `FUNDFLOW_DATA_DIR=/data` automatically (the Dockerfile default).
+4. **Add a Volume** (only if Railway didn't auto-create it from `railway.json`):
+   - Go to the service → **Variables** → **Add Volume**.
    - **Name:** `fundflow-data`
    - **Mount Path:** `/data`
-   - **Size:** 1 GB (enough for hundreds of resumes)
-6. Update `DATABASE_URL` to use the mount path:
-   ```
-   DATABASE_URL=sqlite:////data/fundflow.db
-   ```
-7. Update `main.py` (or via env override) so `uploads/` and `cache/` resolve under `/data`:
-   - Set `FUNDFLOW_DATA_DIR=/data` in environment.
-   - In `backend/main.py` (or a small startup helper), set:
-     ```python
-     import os
-     os.makedirs(os.environ.get("FUNDFLOW_DATA_DIR", "."), exist_ok=True)
-     UPLOAD_DIR = Path(os.environ["FUNDFLOW_DATA_DIR"]) / "uploads"
-     CACHE_DIR  = Path(os.environ["FUNDFLOW_DATA_DIR"]) / "cache"
-     ```
-8. Click **Create Web Service**.
+5. Add environment variables (see [Environment variables](#environment-variables) above). **Required:**
+   - `OPENROUTER_API_KEY` — your real key (`sk-or-v1-…`).
+   - `ALLOWED_ORIGINS` — JSON array including the deployed Vercel origin, e.g. `["https://fundflow-ai.vercel.app"]`.
+   - `DATABASE_URL` — `sqlite:////data/fundflow.db` (note: four slashes — `sqlite:///` + absolute path `/data/...`).
+6. (Optional) Add `TAVILY_API_KEY` and `FIRECRAWL_API_KEY` for live company discovery.
+7. Click **Deploy**. First deploy takes ~3-5 minutes (pip install of PyMuPDF, pdfplumber, etc.).
+8. Note the deployed Railway URL (e.g. `fundflow-ai.up.railway.app`).
+9. Go back to **Vercel** and update `VITE_API_BASE_URL` to the Railway URL, then redeploy the frontend.
 
 ### Health check
 
-Render will hit `/api/health` automatically. The endpoint returns `{"status":"healthy"}` with `200`.
+Railway will hit `/api/health` automatically (configured in `railway.json`). The endpoint returns `{"status":"healthy"}` with `200`.
+
+### Why we use a single worker (`--workers 1`)
+
+SQLite serializes writes. Running with multiple workers causes `database is locked` errors. Keep `numReplicas: 1` (also configured in `railway.json`) until migrating to PostgreSQL.
 
 ---
 
-## Backend on Railway
+## Backend on Render — alternative
 
-1. **Sign in** to <https://railway.app> and click **New Project → Deploy from GitHub**.
-2. Select the repository, click **Add variables**:
-   - All env vars from the table above.
-3. In **Settings → Deploy**:
-   - **Root Directory:** `backend`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Add a **Volume** at `/data` (1 GB).
-5. Update `DATABASE_URL` and `FUNDFLOW_DATA_DIR` as in the Render section.
+> **Note:** Render is supported as an alternative target. The repo keeps `render.yaml` for users who prefer Render's Blueprint flow. Railway remains the primary target.
 
-Railway auto-assigns a domain (`https://fundflow-ai.up.railway.app`). Add a custom domain in **Settings → Networking**.
+1. **Sign in** to <https://render.com> and click **New → Blueprint**.
+2. Connect the GitHub repo. Render reads `render.yaml` and pre-fills the service config.
+3. Open the resulting service and set these **secret env vars** in the dashboard:
+   - `OPENROUTER_API_KEY` — your real key.
+   - `ALLOWED_ORIGINS` — JSON array including the deployed Vercel origin.
+4. (Optional) Set `TAVILY_API_KEY` and `FIRECRAWL_API_KEY`.
+5. Click **Manual Deploy → Deploy latest commit**.
+
+Render's Blueprint creates a 1 GB disk at `/data` and mounts it via the `disk:` block in `render.yaml`. Everything else is pre-set.
 
 ---
 
