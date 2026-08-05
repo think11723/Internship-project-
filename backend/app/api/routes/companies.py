@@ -559,21 +559,33 @@ async def list_companies(
 
         scored.append(item)
 
-    # Apply sorting using pre-computed values
+    # Apply sorting using pre-computed values.
+    # Every lambda uses the ``x.get(key) or default`` pattern so that
+    # values explicitly set to ``None`` (e.g. ``match_score`` when no
+    # resume is uploaded, ``founded_year`` for older seed entries) fall
+    # back to a safe default. ``dict.get(key, default)`` alone is NOT
+    # sufficient — it returns ``default`` only when the key is *missing*,
+    # not when the key exists with value ``None``. Sorting ``None`` keys
+    # raises ``TypeError: '<' not supported between instances of
+    # 'NoneType' and 'NoneType'`` in CPython.
     valid_sort_fields = {
-        "match_score": lambda x: x.get("match_score", 0),
-        "funding_amount": lambda x: company_metadata.get(x.get("name", ""), {}).get("funding_millions", 0),
-        "company_size": lambda x: company_metadata.get(x.get("name", ""), {}).get("size_sort", 0),
-        "alphabetical": lambda x: x.get("name", "").lower(),
-        "newest": lambda x: int(x.get("founded_year", "0")),
+        "match_score": lambda x: (x.get("match_score") or 0),
+        "funding_amount": lambda x: (
+            company_metadata.get(x.get("name", ""), {}).get("funding_millions") or 0
+        ),
+        "company_size": lambda x: (
+            company_metadata.get(x.get("name", ""), {}).get("size_sort") or 0
+        ),
+        "alphabetical": lambda x: ((x.get("name")) or "").lower(),
+        "newest": lambda x: int(x.get("founded_year") or 0),
     }
-    
+
     if sort_by in valid_sort_fields:
         reverse = sort_order.lower() == "desc"
         scored.sort(key=valid_sort_fields[sort_by], reverse=reverse)
     else:
         # Default: sort by match score descending, then alphabetical
-        scored.sort(key=lambda x: (-x.get("match_score", 0), x.get("name", "").lower()))
+        scored.sort(key=lambda x: (-(x.get("match_score") or 0), (x.get("name") or "").lower()))
 
     # Apply pagination
     total = len(scored)
