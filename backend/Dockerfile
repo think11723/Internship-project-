@@ -42,4 +42,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Single worker for SQLite safety. Increase only after migrating to
 # PostgreSQL or after enabling WAL mode + connection pooling.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+# Use the SHELL form (not the JSON array "exec" form) so the shell
+# performs variable expansion on $PORT. Works identically for
+# local Docker, Render, and Railway.
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1
