@@ -1,0 +1,424 @@
+"""Orchestrator service - coordinates the weekly career report workflow.
+
+This is the foundation module that all future AI services plug into.
+Currently produces personalized reports from real-world AI startup
+discovery (Tavily + Firecrawl + OpenAI), with a local cache and a
+Demo Data fallback when discovery is unavailable.
+"""
+
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.models.resume import Resume
+from app.services.generation_service import generate_cover_letter
+from app.services.intelligence import career_intelligence, market_intelligence
+
+logger = logging.getLogger("fundflow")
+
+_SEED_PATH = Path(__file__).resolve().parent.parent / "data" / "seed_companies.json"
+_CACHE_PATH = Path(__file__).resolve().parent.parent / "cache" / "latest_discovery.json"
+
+
+def _simulate_stage(name: str, duration: float) -> None:
+    """Log workflow stage progress.
+
+    NOTE: time.sleep() removed for production. Stage delays were previously
+    used for UX simulation. In production, stages execute synchronously.
+    """
+    logger.info("[Workflow] %s (%.2fs)", name, duration)
+
+
+def _load_seed_companies() -> List[Dict[str, Any]]:
+    """Load the curated Demo Data set of funded AI startups.
+
+    Used as the fallback when no cache exists and discovery fails.
+    """
+    with open(_SEED_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _read_cache() -> Optional[Dict[str, Any]]:
+    """Return cached discovery if it exists and is fresh, else None with metadata."""
+    if not _CACHE_PATH.exists():
+        return None
+    age_hours = (time.time() - _CACHE_PATH.stat().st_mtime) / 3600.0
+    if age_hours >= settings.DISCOVERY_CACHE_HOURS:
+        return None
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and data:
+            logger.info(
+                "Using cached discovery (%d companies, %.1fh old)",
+                len(data),
+                age_hours,
+            )
+            return {
+                "companies": data,
+                "metadata": {
+                    "cache_hit": True,
+                    "age_hours": round(age_hours, 2),
+                    "cached_at": time.ctime(_CACHE_PATH.stat().st_mtime),
+                    "cache_path": str(_CACHE_PATH),
+                }
+            }
+    except Exception as exc:
+        logger.warning("Failed to read discovery cache: %s", exc)
+    return None
+
+
+def _write_cache(companies: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Persist discovered companies to the cache file with metadata."""
+    try:
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(companies, f, indent=2)
+        logger.info("Cached %d discovered companies", len(companies))
+        return {
+            "cache_hit": False,
+            "cached_at": time.ctime(_CACHE_PATH.stat().st_mtime),
+            "cache_path": str(_CACHE_PATH),
+            "companies_count": len(companies),
+        }
+    except Exception as exc:
+        logger.warning("Failed to write discovery cache: %s", exc)
+        return {"cache_hit": False, "error": str(exc)}
+
+
+def invalidate_cache() -> bool:
+    """Manually invalidate the discovery cache."""
+    try:
+        if _CACHE_PATH.exists():
+            _CACHE_PATH.unlink()
+            logger.info("Discovery cache invalidated")
+            return True
+        return False
+    except Exception as exc:
+        logger.warning("Failed to invalidate cache: %s", exc)
+        return False
+
+
+def get_cache_stats() -> Dict[str, Any]:
+    """Get cache statistics and health information."""
+    if not _CACHE_PATH.exists():
+        return {
+            "exists": False,
+            "age_hours": 0,
+            "size_bytes": 0,
+            "status": "no_cache",
+        }
+    
+    try:
+        stat = _CACHE_PATH.stat()
+        age_hours = (time.time() - stat.st_mtime) / 3600.0
+        is_fresh = age_hours < settings.DISCOVERY_CACHE_HOURS
+        
+        with open(_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        return {
+            "exists": True,
+            "age_hours": round(age_hours, 2),
+            "size_bytes": stat.st_size,
+            "is_fresh": is_fresh,
+            "status": "fresh" if is_fresh else "stale",
+            "companies_count": len(data) if isinstance(data, list) else 0,
+            "cached_at": time.ctime(stat.st_mtime),
+            "cache_path": str(_CACHE_PATH),
+        }
+    except Exception as exc:
+        logger.warning("Failed to get cache stats: %s", exc)
+        return {
+            "exists": True,
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+def _run_discovery() -> List[Dict[str, Any]]:
+    """Run the live discovery pipeline. Raises on any failure."""
+    from app.services.discovery_service import discover_companies_from_web
+
+    companies = discover_companies_from_web()
+    if not companies:
+        raise RuntimeError("Discovery returned no companies")
+    return companies
+
+
+def _load_companies() -> List[Dict[str, Any]]:
+    """Smart loader: cache -> live discovery -> Demo Data fallback.
+
+    Never raises. Always returns a non-empty list of companies.
+
+    On cache miss we run live discovery. If discovery fails for any
+    reason (missing keys, network error, model rot) we fall back to
+    the curated Demo Data and **persist that fallback to the cache** so
+    subsequent requests are instant — we never run the same failing
+    discovery twice in a row.
+    """
+    cached = _read_cache()
+    if cached is not None:
+        return cached["companies"] if isinstance(cached, dict) else cached
+
+    try:
+        companies = _run_discovery()
+        _write_cache(companies)
+        return companies
+    except Exception as exc:
+        logger.warning(
+            "Live discovery unavailable (%s); using Demo Data and "
+            "caching it as a fallback so subsequent requests are instant",
+            exc,
+        )
+        seed = _load_seed_companies()
+        # Cache the fallback so we don't repeat the failing discovery.
+        _write_cache(seed)
+        return seed
+
+
+def _aggregate_skills(lists: List[List[str]]) -> List[str]:
+    """Merge multiple skill lists into one deduplicated, normalized set.
+
+    - Removes duplicates (case-insensitive)
+    - Ignores empty / whitespace-only values
+    - Trims whitespace on each entry
+    - Preserves the original casing of the first occurrence for UI display
+      (e.g. "FastAPI" stays "FastAPI", not "Fastapi")
+    """
+    seen: Dict[str, str] = {}
+    for lst in lists:
+        if not lst:
+            continue
+        for item in lst:
+            if not isinstance(item, str):
+                continue
+            v = item.strip()
+            if not v:
+                continue
+            key = v.lower()
+            if key not in seen:
+                seen[key] = v
+    return list(seen.values())
+
+
+def _build_candidate(resume: Resume) -> Dict[str, Any]:
+    """Build the candidate profile section from a resume row.
+
+    When the resume row carries a Ticket-009 rich profile in
+    ``analysis_json``, we aggregate skills from every category
+    (skills, technologies, programming_languages, frameworks, cloud,
+    databases, tools) into a single normalized skill list used by the
+    matching engine. The legacy DB columns remain as a fallback when
+    no rich profile is present.
+    """
+    rich = resume.analysis_json if isinstance(resume.analysis_json, dict) else {}
+
+    aggregated_skills = _aggregate_skills(
+        [
+            rich.get("skills") or [],
+            rich.get("technologies") or [],
+            rich.get("programming_languages") or [],
+            rich.get("frameworks") or [],
+            rich.get("cloud") or [],
+            rich.get("databases") or [],
+            rich.get("tools") or [],
+            list(resume.skills or []),
+            list(resume.technologies or []),
+        ]
+    )
+
+    return {
+        "name": (rich.get("name") or resume.name or ""),
+        "email": (rich.get("email") or resume.email or ""),
+        "phone": (rich.get("phone") or resume.phone or ""),
+        "location": (rich.get("location") or resume.location or ""),
+        "summary": (
+            rich.get("professional_summary")
+            or rich.get("summary")
+            or resume.summary
+            or ""
+        ),
+        "years_of_experience": (
+            rich.get("years_of_experience") or ""
+        ),
+        "recommended_roles": list(rich.get("recommended_roles") or []),
+        "skills": aggregated_skills,
+        "technologies": list(
+            rich.get("technologies") or resume.technologies or []
+        ),
+        "experience": list(resume.experience or []),
+        "education": list(resume.education or []),
+        "rich_profile": rich,
+    }
+
+
+def _format_skills_list(skills: List[str]) -> str:
+    """Format a list of skills as a natural-language phrase.
+
+    Preserves the original casing of each skill (no ``.title()``) so
+    things like "FastAPI" render as "FastAPI". Uses a plain comma list
+    without the Oxford comma to match the wording in Ticket-010.
+    """
+    if not skills:
+        return ""
+    if len(skills) == 1:
+        return skills[0]
+    if len(skills) == 2:
+        return f"{skills[0]} and {skills[1]}"
+    return ", ".join(skills[:-1]) + f" and {skills[-1]}"
+
+
+def _build_reason(overlap: List[str], company: Dict[str, Any]) -> str:
+    """Build a personalized 'why it matches' reason from overlapping skills.
+
+    The text is deterministic — no LLM call. The phrasing surfaces
+    actual overlapping technologies by name so reviewers can see why
+    the orchestrator ranked this company highly.
+    """
+    if not overlap:
+        return (
+            f"{company['name']} doesn't directly require the skills listed "
+            "on your resume, but their broader stack and hiring signals "
+            "are adjacent to your background — worth a closer look."
+        )
+
+    visible = overlap[:4]
+    skills_text = _format_skills_list(visible)
+    if len(overlap) > 4:
+        skills_text += " and more"
+
+    return (
+        f"Matched because your experience with {skills_text} aligns "
+        f"with {company['name']}'s preferred engineering stack."
+    )
+
+
+def _score_company(company: Dict[str, Any], candidate_skills: List[str]) -> Dict[str, Any]:
+    """Score one company against the candidate's skills.
+
+    Score formula: 70 + (overlap_count * 6), capped at 98.
+    Lower bound is 70 (matches the ticket's required range).
+    """
+    company_skills = {s.lower() for s in company.get("skills", [])}
+    candidate_set = {s.lower() for s in candidate_skills}
+    overlap = sorted(company_skills & candidate_set)
+    score = min(98, 70 + len(overlap) * 6)
+    return {"company": company, "score": score, "overlap": overlap}
+
+
+def _select_top_matches(
+    companies: List[Dict[str, Any]], candidate_skills: List[str]
+) -> List[Dict[str, Any]]:
+    """Score, sort, and return the top 3 companies for the candidate."""
+    scored = [_score_company(c, candidate_skills) for c in companies]
+    # Stable ordering: highest score first, then alphabetical for deterministic ties.
+    scored.sort(key=lambda x: (-x["score"], x["company"]["name"]))
+    top = scored[:3]
+
+    results: List[Dict[str, Any]] = []
+    for item in top:
+        result = dict(item["company"])  # all seed fields
+        result["score"] = item["score"]
+        result["reason"] = _build_reason(item["overlap"], item["company"])
+        results.append(result)
+    return results
+
+
+def run_weekly_report(db: Session) -> Dict[str, Any]:
+    """Run the weekly career intelligence report workflow.
+
+    Ticket-014 refactor: the orchestrator now exposes six explicit
+    stages of a Career Intelligence Agent. Stages are synchronous;
+    no LangGraph, no async workers.
+
+        Stage 1 - Resume Intelligence
+        Stage 2 - Market Intelligence
+        Stage 3 - Company Intelligence
+        Stage 4 - Career Intelligence
+        Stage 5 - Opportunity Ranking
+        Stage 6 - Report Assembly
+
+    Args:
+        db: SQLAlchemy session.
+
+    Returns:
+        Dictionary with either:
+        - {summary, candidate, generated_at, companies_found,
+           top_matches, cover_letter, market_summary,
+           industry_breakdown, career_intelligence,
+           technology_breakdown, top_strengths, top_skill_gaps}
+        - {requires_resume: True, message}
+    """
+    # ---------- Stage 1: Resume Intelligence ----------
+    _simulate_stage("Reading Resume", 0.3)
+    latest_resume: Optional[Resume] = (
+        db.query(Resume).order_by(Resume.parsed_at.desc()).first()
+    )
+
+    if latest_resume is None:
+        return {
+            "requires_resume": True,
+            "message": "Please upload your resume first.",
+        }
+
+    _simulate_stage("Understanding Candidate Profile", 0.3)
+    candidate = _build_candidate(latest_resume)
+
+    # ---------- Stage 2: Market Intelligence ----------
+    _simulate_stage("Discovering High-Growth AI Companies", 0.4)
+    companies = _load_companies()
+    market = market_intelligence(companies)
+    market_summary = market["market_summary"]
+    industry_breakdown = market["industry_breakdown"]
+
+    # ---------- Stage 3: Company Intelligence ----------
+    _simulate_stage("Matching Skills", 0.3)
+    top_matches = _select_top_matches(companies, candidate["skills"])
+
+    # ---------- Stage 4: Career Intelligence ----------
+    _simulate_stage("Ranking Opportunities", 0.3)
+    career = career_intelligence(candidate, companies, top_matches)
+    career_intelligence_block = career["career_intelligence"]
+    technology_breakdown = career["technology_breakdown"]
+    top_strengths = career["top_strengths"]
+    top_skill_gaps = career["top_skill_gaps"]
+
+    # ---------- Stage 5: Opportunity Ranking (already done in Stage 3) ----------
+    # top_matches is already sorted by score desc + name asc.
+
+    # ---------- Stage 6: Report Assembly ----------
+    _simulate_stage("Generating Cover Letter", 0.4)
+    cover_letter = None
+    if top_matches:
+        cover_letter = generate_cover_letter(candidate, top_matches[0])
+
+    _simulate_stage("Preparing Weekly Career Report", 0.4)
+
+    name = candidate.get("name") or ""
+    if name:
+        summary = f"Weekly Career Intelligence Report for {name}"
+    else:
+        summary = "Weekly Career Intelligence Report"
+
+    return {
+        "summary": summary,
+        "candidate": candidate,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "companies_found": len(companies),
+        "top_matches": top_matches,
+        "cover_letter": cover_letter,
+        # ----- Ticket-014 new intelligence fields -----
+        "market_summary": market_summary,
+        "industry_breakdown": industry_breakdown,
+        "career_intelligence": career_intelligence_block,
+        "technology_breakdown": technology_breakdown,
+        "top_strengths": top_strengths,
+        "top_skill_gaps": top_skill_gaps,
+    }

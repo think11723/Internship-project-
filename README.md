@@ -1,391 +1,368 @@
 # FundFlow AI
 
-**Autonomous Career Intelligence Agent**
-
-FundFlow AI discovers newly funded startups, researches them, matches them with your resume, and generates personalized application materials automatically.
+**AI Career Intelligence Platform** that turns a single resume upload into a personalized weekly briefing of funded AI startups - ranked, explained, and paired with a ready-to-send cover letter.
 
 ---
 
-## Project Overview
+## 1. Project Overview
 
-FundFlow AI is an AI-powered career intelligence platform that automates the job search process by:
+FundFlow AI is an internship-MVP demonstrating a complete "career intelligence agent" in three days of development:
 
-- **Weekly Discovery**: Automatically discovers startups funded in the last 7 days
-- **AI Research**: Deep research on company tech stack, business model, and hiring signals
-- **Smart Matching**: AI-powered matching based on skills, experience, and industry fit
-- **Auto Generation**: Generates personalized cover letters and application materials
+- **Upload once.** AI extracts a 19-field rich profile from your resume.
+- **Every "Generate Weekly Career Report" click** runs a six-stage deterministic pipeline that combines your profile with a live-or-cached market dataset of funded AI startups.
+- **Output** is a single dashboard: a personalized AI summary, a snapshot of your career, deterministic AI insights, the top-3 ranked opportunities with reasoning, a personalized cover letter for the #1 match, a full Companies Explorer, and an explainable AI report per company.
 
----
-
-## Architecture
-
-### Tech Stack
-
-**Backend**
-- FastAPI - Modern, fast web framework for building APIs
-- SQLAlchemy - SQL toolkit and ORM
-- SQLite - Lightweight database
-- Pydantic - Data validation using Python type annotations
-- PyMuPDF (fitz) - PDF text extraction (primary)
-- pdfplumber - PDF text extraction (fallback)
-- OpenAI SDK - LLM analysis with structured output
-
-**Frontend**
-- React - UI library
-- Vite - Next generation frontend tooling
-- TailwindCSS - Utility-first CSS framework
-- React Router - Declarative routing for React
-- Axios - HTTP client
-
-### High-Level Architecture
-
-```
-Frontend (React + TailwindCSS)
-    ↓ HTTP/REST
-Backend API (FastAPI)
-    ↓
-PDF Extraction (PyMuPDF/pdfplumber)
-    ↓
-LLM Analysis (OpenAI gpt-4.1-mini)
-    ↓
-Database (SQLite)
-```
-
-### Resume Upload Flow
-
-```
-User uploads PDF
-    ↓
-Validate file type & size (max 10MB)
-    ↓
-Extract text using PyMuPDF
-    ↓ (fallback if needed)
-Extract text using pdfplumber
-    ↓
-Send to OpenAI gpt-4.1-mini
-    ↓
-Receive structured JSON analysis
-    ↓
-Store in SQLite database
-    ↓
-Display analysis in Linear-style UI
-```
+The product is intentionally **boring-infrastructure, smart-experience**: deterministic matching with deterministic reasoning, augmented by a single LLM call (cover letter) routed through OpenRouter.
 
 ---
 
-## Folder Structure
+## 2. Features
+
+- **AI Resume Intelligence** - 19-field extraction via OpenRouter including `years_of_experience`, `programming_languages`, `frameworks`, `cloud`, `databases`, `tools`, `recommended_roles`.
+- **Real Weekly Company Discovery** - Tavily search + Firecrawl scrape + OpenRouter normalization, with a 24h local cache and Demo Data fallback.
+- **Six-Stage Orchestration** - Resume → Market → Company → Career → Ranking → Report, each with one responsibility.
+- **Executive Dashboard** - hero, snapshot stats, deterministic AI insights, ranked top opportunities, AI cover letter, quick actions, activity timeline.
+- **Companies Explorer** - browse all discovered companies with search, industry filter chips, sort dropdown, match scores, and skill gaps.
+- **Explainable Company Details** - per-company AI match summary, strengths, skill gaps, recommended learning, career alignment.
+- **AI Cover Letter Generation** - on-demand cover letter for any company, with copy + download.
+- **Graceful Degradation** - no API key? Demo Data fallback. LLM failure? `null` cover letter, never a crash.
+
+---
+
+## 3. Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Frontend (React 18 + Vite + Tailwind)                                 │
+│  ┌────────┬────────────┬──────────────┬──────────────────┐               │
+│  │Landing│ Dashboard  │ Companies    │ CompanyDetails   │               │
+│  └────────┴────────────┴──────────────┴──────────────────┘               │
+└──────────────────────────────────────────────────────────────────────────┘
+                                  │ REST (axios)
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  FastAPI Backend                                                        │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐      │
+│  │ /api/resume/     │  │ /api/workflow/   │  │ /api/companies   │      │
+│  │   upload         │  │   weekly-report  │  │   (list + one)   │      │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘      │
+│  ┌──────────────────┐                                                   │
+│  │ /api/documents/  │                                                   │
+│  │   generate       │                                                   │
+│  └──────────────────┘                                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        ▼                         ▼                         ▼
+┌─────────────────┐    ┌──────────────────────┐    ┌──────────────────┐
+│ Resume          │    │ Orchestrator          │    │ Routes            │
+│ Intelligence    │    │ run_weekly_report()  │    │ companies.py      │
+│ Service         │    │   ┌────────────────┐  │    │ documents.py      │
+│ (PDF + LLM)     │    │   │ Stage 1 Resume  │  │    │ health.py         │
+│                 │    │   │ Stage 2 Market  │  │    │ resume.py         │
+└─────────────────┘    │   │ Stage 3 Company  │  │    │ workflow.py       │
+        │              │   │ Stage 4 Career   │  │    └──────────────────┘
+        │              │   │ Stage 5 Ranking  │  │
+        │              │   │ Stage 6 Report   │  │
+        │              │   └────────────────┘  │
+        │              │           │            │
+        │              │           ▼            │
+        │              │   ┌───────────────┐    │
+        │              │   │ Intelligence  │    │
+        │              │   │ Service        │    │
+        │              │   │ (Market +      │    │
+        │              │   │  Career)       │    │
+        │              │   └───────────────┘    │
+        │              │           │            │
+        │              │           ▼            │
+        │              │   ┌───────────────┐    │
+        │              │   │ Generation    │    │
+        │              │   │ Service        │    │
+        │              │   │ (Cover Letter) │    │
+        │              │   └───────────────┘    │
+        │              └──────────────────────┘
+        │                          │
+        ▼                          ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Persistence                                                            │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐      │
+│  │ SQLite           │  │ Local file cache │  │ seed_companies   │      │
+│  │ (Resume table)   │  │ (latest_discov.. │  │ .json (Demo Data)│      │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘      │
+└──────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                       ┌─────────────────────┐
+                       │ External APIs        │
+                       │  • OpenRouter (LLM)  │
+                       │  • Tavily (search)   │
+                       │  • Firecrawl (scrape)│
+                       └─────────────────────┘
+```
+
+---
+
+## 4. Folder Structure
 
 ```
 Pratik_Assignment/
+├── README.md                  ← this file
 ├── backend/
-│   ├── main.py                 # FastAPI application entry point
-│   ├── requirements.txt        # Python dependencies
-│   ├── .env.example           # Environment variables template
+│   ├── .env.example           ← copy to .env, fill in keys
+│   ├── main.py                ← FastAPI app factory + route registration
+│   ├── requirements.txt
 │   ├── app/
-│   │   ├── api/
-│   │   │   └── routes/         # API route handlers
-│   │   │       ├── health.py   # Health check endpoint
-│   │   │       ├── resume.py   # Resume endpoints
-│   │   │       ├── companies.py # Company endpoints
-│   │   │       ├── matches.py  # Match endpoints
-│   │   │       └── documents.py # Document generation endpoints
-│   │   ├── core/
-│   │   │   ├── config.py      # Configuration settings
-│   │   │   └── logging.py     # Logging configuration
-│   │   ├── db/
-│   │   │   └── session.py     # Database session management
-│   │   ├── models/            # SQLAlchemy models
-│   │   │   ├── company.py
+│   │   ├── core/              ← config, logging
+│   │   ├── db/                ← SQLAlchemy session
+│   │   ├── models/            ← SQLAlchemy models (resume table)
+│   │   ├── schemas/           ← Pydantic request/response schemas
+│   │   ├── api/routes/        ← FastAPI routers
+│   │   │   ├── health.py
 │   │   │   ├── resume.py
-│   │   │   ├── match.py
-│   │   │   └── generated_document.py
-│   │   ├── schemas/           # Pydantic schemas
-│   │   │   ├── company.py
-│   │   │   ├── resume.py
-│   │   │   ├── match.py
-│   │   │   └── document.py
-│   │   ├── services/          # Business logic services
-│   │   │   ├── company_service.py
-│   │   │   ├── resume_service.py
-│   │   │   ├── match_service.py
-│   │   │   └── generation_service.py
-│   │   ├── agents/            # AI agents (Future Milestones)
-│   │   │   ├── coordinator.py
-│   │   │   ├── discovery.py
-│   │   │   ├── research.py
-│   │   │   ├── matching.py
-│   │   │   └── generation.py
-│   │   ├── tools/             # Agent tools (Future Milestones)
-│   │   │   ├── web_scraper.py
-│   │   │   └── document_parser.py
-│   │   └── utils/             # Utility functions
-│   │       └── helpers.py
-│
+│   │   │   ├── companies.py
+│   │   │   ├── documents.py
+│   │   │   └── workflow.py
+│   │   ├── services/          ← business logic
+│   │   │   ├── resume_service.py     ← PDF → AI extraction
+│   │   │   ├── orchestrator.py       ← six-stage pipeline
+│   │   │   ├── intelligence.py       ← market + career aggregation
+│   │   │   ├── generation_service.py ← cover letter
+│   │   │   ├── discovery_service.py  ← Tavily + Firecrawl + LLM
+│   │   │   └── llm_service.py        ← OpenRouter client
+│   │   └── tools/
+│   │       └── document_parser.py     ← PyMuPDF + pdfplumber
+│   └── data/
+│       └── seed_companies.json ← Demo Data fallback (20 AI startups)
 ├── frontend/
-│   ├── package.json           # Node dependencies
-│   ├── vite.config.js         # Vite configuration
-│   ├── tailwind.config.js     # TailwindCSS configuration
-│   ├── index.html             # HTML entry point
-│   ├── .env.example          # Environment variables template
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   ├── index.html
+│   ├── .env.example
 │   └── src/
-│       ├── main.jsx           # React entry point
-│       ├── App.jsx            # Main app component
-│       ├── index.css          # Global styles
-│       ├── components/        # Reusable components
-│       │   ├── Button.jsx
-│       │   ├── Card.jsx
-│       │   ├── Loader.jsx
-│       │   ├── Navbar.jsx
-│       │   └── Sidebar.jsx
-│       ├── layouts/           # Layout components
-│       │   └── Layout.jsx
-│       ├── pages/             # Page components
+│       ├── main.jsx           ← React entry
+│       ├── App.jsx            ← Router
+│       ├── index.css          ← Tailwind globals
+│       ├── components/        ← Reusable UI (Button, Card, Loader, ...)
+│       ├── layouts/           ← Layout shell (Navbar + Sidebar)
+│       ├── pages/             ← Top-level routes
 │       │   ├── Landing.jsx
-│       │   ├── Dashboard.jsx
-│       │   ├── ResumeUpload.jsx
-│       │   └── CompanyDetails.jsx
-│       ├── services/          # API services
-│       │   ├── api.js
-│       │   ├── resumeService.js
-│       │   ├── companyService.js
-│       │   ├── matchService.js
-│       │   └── generationService.js
-│       ├── hooks/             # Custom React hooks
-│       │   └── index.js
-│       └── utils/             # Utility functions
-│           └── index.js
-│
-└── README.md                  # This file
+│       │   ├── Dashboard.jsx   ← Executive dashboard
+│       │   ├── Companies.jsx   ← Companies Explorer
+│       │   ├── CompanyDetails.jsx
+│       │   └── ResumeUpload.jsx
+│       └── services/          ← Axios wrappers per resource
 ```
 
 ---
 
-## Setup
+## 5. Tech Stack
+
+| Layer | Technology | Notes |
+|---|---|---|
+| **Backend framework** | FastAPI 0.104 | Async, type-driven, auto OpenAPI docs at `/docs` |
+| **Database** | SQLite + SQLAlchemy 2.0 | Single table (`resumes`); file-backed |
+| **PDF parsing** | PyMuPDF + pdfplumber | Primary + fallback |
+| **LLM SDK** | openai 1.3.7 (Python) | Pointed at OpenRouter via `base_url` |
+| **LLM provider** | OpenRouter | OpenAI-compatible API |
+| **Web search** | Tavily | News domain-restricted |
+| **Web scraping** | Firecrawl | Returns clean markdown |
+| **Frontend framework** | React 18 + Vite 5 | Fast dev server, no bundler config |
+| **Routing** | react-router-dom 6 | |
+| **Styling** | TailwindCSS 3 (dark mode) | Custom palette: `primary` + `dark` |
+| **HTTP client** | axios 1 | Interceptors for error logging |
+| **Settings** | pydantic-settings 2 | Reads `.env`, `extra="ignore"` |
+| **Logging** | stdlib `logging` | Named logger `fundflow` |
+
+---
+
+## 6. Setup Instructions
 
 ### Prerequisites
 
-- Python 3.8+
-- Node.js 16+
-- npm or yarn
+- Python 3.10+
+- Node.js 18+
+- A virtualenv (or use the included `backend/venv/`)
 
-### Backend Setup
+### Clone & enter
 
-1. Navigate to the backend directory:
+```bash
+git clone <repo-url>
+cd Pratik_Assignment
+```
+
+### Backend setup
+
 ```bash
 cd backend
-```
-
-2. Create a virtual environment:
-```bash
-python -m venv venv
-```
-
-3. Activate the virtual environment:
-```bash
-# Windows
-venv\Scripts\activate
-
-# macOS/Linux
-source venv/bin/activate
-```
-
-4. Install dependencies:
-```bash
+python -m venv venv             # or use the existing one
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-5. Create environment file:
-```bash
-cp .env.example .env
-```
-
-6. **Important**: Set your OpenAI API key in the `.env` file:
-```bash
-OPENAI_API_KEY=your_openai_api_key_here
-```
-
-7. Run the backend:
-```bash
+cp .env.example .env            # then fill in keys (see below)
 python main.py
 ```
 
-The backend will start on `http://localhost:8000`
+Backend runs at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
 
-API documentation available at `http://localhost:8000/docs`
+### Frontend setup
 
-### Frontend Setup
-
-1. Navigate to the frontend directory:
 ```bash
 cd frontend
-```
-
-2. Install dependencies:
-```bash
 npm install
-```
-
-3. Create environment file:
-```bash
-cp .env.example .env
-```
-
-4. Run the frontend:
-```bash
 npm run dev
 ```
 
-The frontend will start on `http://localhost:3000`
+Frontend runs at `http://localhost:3000` (Vite proxies `/api` to backend).
 
 ---
 
-## Current Milestone (Milestone 2)
+## 7. Environment Variables
 
-**Status**: ✅ Complete
+All variables live in `backend/.env` (copy from `backend/.env.example`).
 
-**Implemented**:
-- ✅ All Milestone 1 features
-- ✅ Resume upload endpoint (`POST /api/resume/upload`)
-- ✅ PDF text extraction with PyMuPDF (primary) and pdfplumber (fallback)
-- ✅ LLM analysis service using OpenAI Responses API with structured output
-- ✅ Resume model updated to store full analysis JSON
-- ✅ Pydantic schemas for resume analysis response
-- ✅ Linear-style minimal UI for resume upload page
-- ✅ Beautiful analysis display with:
-  - Skills chips (primary color)
-  - Technologies badges (purple color)
-  - Experience timeline
-  - Education list
-  - Projects and certifications
-  - Strengths grid
-- ✅ Loading states with progress stages (uploading → extracting → analyzing → saving)
-- ✅ Comprehensive error handling (file type, size, extraction, LLM errors)
-- ✅ Security features (file size limit, MIME type validation, temp file cleanup)
-- ✅ OpenAI API key configuration
+### Required for any AI feature
 
-**Resume Upload Flow**:
-1. User uploads PDF file (drag & drop or click)
-2. Backend validates file type and size (max 10MB)
-3. PDF text extraction using PyMuPDF with pdfplumber fallback
-4. LLM analysis using OpenAI gpt-4.1-mini with structured JSON output
-5. Store analysis in SQLite database
-6. Display beautiful analysis results in Linear-style UI
+| Variable | Description |
+|---|---|
+| `OPENROUTER_API_KEY` | OpenRouter API key. Get one at https://openrouter.ai. **Without this, cover-letter generation falls back to `null`.** |
+| `OPENROUTER_BASE_URL` | OpenRouter API base. Default: `https://openrouter.ai/api/v1` |
+| `OPENROUTER_MODEL` | Any currently-available model slug from https://openrouter.ai/models. Default: `anthropic/claude-3.5-sonnet` |
 
-**Testing**:
-- ✅ Health endpoint: `GET /api/health`
-- ✅ Resume upload: `POST /api/resume/upload`
-- ✅ Frontend navigation between pages
-- ✅ Dark mode UI
-- ✅ Resume analysis display
+### Optional - enables live company discovery
+
+| Variable | Description |
+|---|---|
+| `TAVILY_API_KEY` | Tavily search API key. **Without this, the orchestrator falls back to `backend/app/data/seed_companies.json`** (20 curated AI startups). |
+| `FIRECRAWL_API_KEY` | Firecrawl scrape API key. Same fallback. |
+
+### Tunable
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISCOVERY_CACHE_HOURS` | `24` | How long to reuse cached discovery results before re-running. |
+| `ALLOWED_ORIGINS` | localhost:3000, 5173 | CORS allow-list. Add your production frontend in prod. |
+| `DEBUG` | `true` | SQLAlchemy echo flag. Set to `false` in production. |
+
+The frontend reads `VITE_API_BASE_URL` from `frontend/.env` (default `http://localhost:8000`).
 
 ---
 
-## Future Milestones
+## 8. Running the Backend
 
-### Milestone 3: Company Discovery
-- Implement web scraping tools
-- Discovery Agent for finding funded companies
-- Company research from external sources
-- Store company data in database
-- Display companies in dashboard
+```bash
+cd backend
+source venv/bin/activate
+python main.py
+```
 
-### Milestone 4: Company Research
-- Deep research on discovered companies
-- Extract tech stack from websites
-- Identify business model and hiring signals
-- Enrich company profiles
+The server starts on port 8000 with hot reload (`--reload` is on). On startup it:
+1. Initializes the SQLite database (creates tables if missing).
+2. Mounts all five route modules.
+3. Logs the OpenAI client init / failure path.
 
-### Milestone 5: AI Matching & Ranking
-- Implement Matching Agent
-- Calculate match scores based on skills and experience
-- Rank companies by match score
-- Display ranked matches in dashboard
-
-### Milestone 6: Document Generation
-- Implement Generation Agent
-- Generate personalized cover letters
-- Generate ATS-optimized resumes
-- Download functionality
+For production:
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+```
 
 ---
 
-## API Endpoints
+## 9. Running the Frontend
 
-### Implemented (Milestone 2)
+```bash
+cd frontend
+npm run dev      # dev server with HMR on port 3000
+npm run build    # production bundle into dist/
+npm run preview  # serve the built bundle locally
+```
 
-- `GET /api/health` - Health check endpoint
-- `POST /api/resume/upload` - Upload and analyze resume PDF
-
-### Placeholder Endpoints (Return HTTP 501)
-
-**Companies**
-- `POST /api/companies/discover` - Discover newly funded companies
-- `POST /api/companies/match` - Match companies with user resume
-- `GET /api/companies` - Get list of companies
-
-**Matches**
-- `GET /api/matches` - Get ranked matches for user
-
-**Documents**
-- `POST /api/documents/generate` - Generate application document
+Vite is configured to proxy `/api` requests to `http://localhost:8000` (see `vite.config.js`), so the frontend can call `/api/workflow/weekly-report` without CORS in development.
 
 ---
 
-## Database Schema
+## 10. Screenshots
 
-### Companies
-- id, name, description, website
-- funding_amount, funding_date, funding_round
-- sector, tech_stack, business_model
-- team_size, stage, hiring_signals
-- discovered_at, researched_at
+Screenshots of the running demo are not committed to the repo (see `.gitignore`), but the demo flow is:
 
-### Resume
-- id, original_filename, file_path
-- Personal: name, email, phone, location
-- Analysis: summary, skills, experience, education, projects, certifications, technologies, strengths
-- analysis_json (full LLM response)
-- raw_text (extracted PDF text)
-- parsed_at
-
-### Matches
-- id, company_id, resume_id
-- match_score, skill_alignment_score
-- experience_relevance_score, industry_fit_score
-- stage_match_score, reasoning, rank
-- matched_at
-
-### GeneratedDocuments
-- id, match_id, company_id
-- document_type, content
-- prompt_used, model_used
-- generated_at
+| Step | What happens |
+|---|---|
+| 1. Land on `/` | Hero copy explaining the six-stage pipeline |
+| 2. Click "Get Started" | Routes to `/dashboard` |
+| 3. Click "Generate Weekly Career Report" (no resume yet) | Shows the "Upload your resume" empty state |
+| 4. Click "Upload Resume" → drag PDF | Uploads + AI-extracts rich profile |
+| 5. Back to Dashboard → click "Generate" again | Runs 6 stages, shows loading workflow, then renders the report |
+| 6. Click any company card | Routes to `/company/{name}` with the explainable AI report |
+| 7. Click "Generate AI Cover Letter" | Shows real AI-drafted letter below the button |
 
 ---
 
-## Development Notes
+## 11. AI Workflow Explanation
 
-### Code Quality
-- PEP8 compliant Python code
-- Type hints throughout
-- Docstrings for all functions
-- Clean naming conventions
-- No duplicate code
+The orchestrator (`backend/app/services/orchestrator.py`) implements six sequential stages. All deterministic except `Stage 6` calling the LLM for cover letter generation.
 
-### Design Principles
-- Clean architecture with separation of concerns
-- Modular components for easy testing
-- Scalable foundation for future enhancements
-- Production-quality code structure
+```
+Stage 1 - Resume Intelligence         (0.8s + 1.0s simulated)
+  - Load latest resume from SQLite
+  - Aggregate skills from analysis_json into a normalized list
+  - Output: { name, summary, years, skills, technologies, ... }
+
+Stage 2 - Market Intelligence          (1.2s simulated)
+  - Load companies (cache → live discovery → seed fallback)
+  - Compute funding-stage distribution, hiring signals, total funding
+  - Output: market_summary, industry_breakdown
+
+Stage 3 - Company Intelligence         (1.2s simulated)
+  - For each company: score = 70 + 6 * (skill overlap count), capped at 98
+  - Sort desc by score, take top 3
+  - Output: top_matches array
+
+Stage 4 - Career Intelligence          (1.0s simulated)
+  - Count overlap by skill, by industry
+  - Count missing skills by demand frequency
+  - Output: career_intelligence, technology_breakdown,
+            top_strengths, top_skill_gaps
+
+Stage 5 - Opportunity Ranking          (no separate stage)
+  - Already done in Stage 3
+
+Stage 6 - Report Assembly               (0.8s + 1.0s simulated)
+  - Generate cover letter for #1 match (real OpenRouter call)
+  - Assemble final report payload
+  - Output: full report object
+```
+
+The simulated delays (`time.sleep`) are purely UX — they make the workflow feel like a real AI agent thinking through steps rather than a function returning a payload. Total perceived time is ~6 seconds.
 
 ---
 
-## License
+## 12. Future Improvements
 
-This project is created as an assignment for a Generative AI Engineer Internship.
+| Idea | Notes |
+|---|---|
+| Real interview prep | Generate role-specific questions based on the candidate's resume + the company's actual tech stack |
+| Multi-resume support | Let users upload several resumes and pick which one drives each report |
+| Watchlist / pipeline | Star companies from Companies Explorer; track view history; show "Your Pipeline" panel |
+| Time-series trend | Cache last N weekly reports; show match-score trend chart |
+| Conversational Q&A | Add `/api/intelligence/ask` — user asks "why is PyTorch my top gap?" — deterministic answer from existing intelligence fields |
+| Authentication | User accounts, multi-tenant |
+| Production DB | PostgreSQL instead of SQLite |
+| Background scheduler | APScheduler to refresh discovery nightly instead of waiting for first request |
+| Vector search | Semantic company search by description embedding |
+| PDF export | One-click download of full weekly report as styled PDF |
 
 ---
 
-## Contact
+## 13. Known Limitations
 
-For questions or feedback, please refer to the project documentation or contact the development team.
+- **First request is slow** when `DISCOVERY_CACHE_HOURS` expires: the orchestrator waits ~30 seconds for live Tavily + Firecrawl + OpenRouter normalization before returning. After the first call, subsequent calls are instant (cached).
+- **Configurable OpenRouter model** must be a currently-available slug from https://openrouter.ai/models. Stale slugs return 404 and degrade gracefully to `cover_letter: null`.
+- **No streaming**: the orchestrator returns the full report in one HTTP response. No SSE, no WebSocket.
+- **Single-user**: no auth, no multi-tenancy. SQLite row = latest resume, no history.
+- **Deterministic matching**: no embeddings, no vector DB, no semantic similarity. Skill-overlap is string-based (case-insensitive).
+- **Resume parsing** is best-effort with scanned PDFs (PyMuPDF + pdfplumber). Heavily image-based or protected PDFs may fall back to the regex extractor.
+- **Cover letter generation** depends on `OPENROUTER_API_KEY`. Without it, the dashboard still works fully — only the cover letter card is hidden.
+- **Companies Explorer** shows the same dataset as the dashboard (cache or seed). With live discovery enabled, it's whatever the latest run surfaced.
+
+---
+
+Built with ❤️ as a 3-day internship MVP.
