@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Card from '../components/Card'
 import Button from '../components/Button'
+import { getCompanies } from '../services/companyService'
 
 const INDUSTRY_FILTERS = [
   {
@@ -234,9 +235,9 @@ const Companies = () => {
   const [sort, setSort] = useState('match')
 
   useEffect(() => {
-    fetch('/api/companies')
-      .then((r) => r.json())
-      .then((data) => {
+    getCompanies()
+      .then((response) => {
+        const data = response.data || {}
         setCompanies(Array.isArray(data.companies) ? data.companies : [])
         setHasResume(Boolean(data.has_resume))
         setLoading(false)
