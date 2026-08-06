@@ -1,7 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { Search } from 'lucide-react'
 import Card from '../components/Card'
 import Button from '../components/Button'
+import {
+  STRATEGY_TONES,
+  PRIORITY_TONES,
+  TIER_TONES,
+} from '../components/intelligenceTones'
 import { getCompanies } from '../services/companyService'
 
 const INDUSTRY_FILTERS = [
@@ -141,9 +147,108 @@ const ScoreBadge = ({ score }) => (
   </span>
 )
 
+// Sprint 14.1 — Recommendation Intelligence badges.
+// Each is a pure presentation component over the backend
+// `recommendation.intelligence` payload. All fields are optional;
+// the component renders nothing if the value is missing so the
+// card stays clean when no resume has been uploaded.
+
+const StrategyBadge = ({ strategy }) => {
+  if (!strategy) return null
+  const tone = STRATEGY_TONES[strategy] || 'border-border-medium bg-background-secondary text-gray-700'
+  return (
+    <span
+      className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${tone}`}
+      title={strategy}
+    >
+      {strategy}
+    </span>
+  )
+}
+
+const ConfidencePill = ({ confidence }) => {
+  if (confidence == null || confidence === 0) return null
+  return (
+    <span className="rounded-full border border-primary-500/40 bg-primary-500/10 px-2 py-0.5 text-[10px] font-bold text-primary-700">
+      {confidence}% Confidence
+    </span>
+  )
+}
+
+const PriorityChip = ({ priority }) => {
+  if (!priority || priority === 'SKIP') return null
+  const tone =
+    PRIORITY_TONES[priority] ||
+    'border-border-medium bg-background-secondary text-gray-700'
+  return (
+    <span
+      className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${tone}`}
+    >
+      {priority} Priority
+    </span>
+  )
+}
+
+// Sprint 14.2 — Opportunity Intelligence badges.
+// All values come from recommendation.opportunity_v2. The card
+// surfaces only the highest-value signals (tier + score +
+// application order) so the card height stays compact.
+
+// Tier chip: a small uppercase chip carrying the S/A/B/C/D
+// letter. Colour-mapped via TIER_TONES.
+const TierChip = ({ tier }) => {
+  if (!tier) return null
+  const tone =
+    TIER_TONES[tier] ||
+    'border-border-medium bg-background-secondary text-gray-700'
+  return (
+    <span
+      className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${tone}`}
+      title={`Opportunity tier ${tier}`}
+    >
+      {tier} Tier
+    </span>
+  )
+}
+
+// Score badge: "89 / 100" with a colour band matching the tier.
+// Re-uses the tier colour family for instant readability.
+const OpportunityScoreBadge = ({ score, tier }) => {
+  if (score == null) return null
+  const clamped = Math.max(0, Math.min(100, score))
+  const tone =
+    TIER_TONES[tier] ||
+    'border-border-medium bg-background-secondary text-gray-700'
+  return (
+    <span
+      className={`rounded-full border px-2 py-0.5 text-[10px] font-bold ${tone}`}
+      title={`Opportunity score ${clamped}/100`}
+    >
+      {clamped} / 100
+    </span>
+  )
+}
+
+// Application order chip: shown only when the list is sorted by
+// opportunity rank and the backend has emitted a 1-based order.
+// We display as "#N Priority" so the user understands it's a
+// queue position, not a score.
+const ApplicationOrderChip = ({ rank }) => {
+  if (!rank || rank < 1) return null
+  return (
+    <span className="rounded-full border border-primary-500/40 bg-primary-500/10 px-2 py-0.5 text-[10px] font-bold text-primary-700">
+      #{rank} Priority
+    </span>
+  )
+}
+
 const CompanyCard = ({ company, hasResume }) => {
   return (
-    <Card className="flex h-full flex-col p-6 hover:border-primary-500/40 hover:shadow-pipeup-lg transition-all duration-pipeup">
+    <Card
+      hover
+      padding="md"
+      className="flex h-full flex-col"
+    >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
           <h3 className="truncate text-base font-bold text-dark-primary">
@@ -191,6 +296,41 @@ const CompanyCard = ({ company, hasResume }) => {
         )}
       </div>
 
+      {/* Sprint 14.1 — Recommendation Intelligence row.
+          Renders ONLY when the backend has populated the
+          per-company ``recommendation.intelligence`` block (which
+          happens after a resume has been uploaded). When missing
+          (no resume, or recommendation not yet built), this row
+          is absent — keeping the card uncluttered and matching the
+          "graceful fallback" requirement. */}
+      {hasResume && company.recommendation?.intelligence && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+          <StrategyBadge strategy={company.recommendation.intelligence.strategy} />
+          <ConfidencePill confidence={company.recommendation.intelligence.confidence} />
+          <PriorityChip priority={company.recommendation.intelligence.priority} />
+        </div>
+      )}
+
+      {/* Sprint 14.2 — Opportunity Intelligence row.
+          Sits BELOW Recommendation so the user reads strategy first,
+          then opportunity. Only renders when the backend has
+          populated ``recommendation.opportunity_v2``. The three
+          chips together communicate: how strong is this opportunity
+          (tier), how does it score numerically (score), and where
+          does it rank in the application queue (order). */}
+      {hasResume && company.recommendation?.opportunity_v2 && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          <TierChip tier={company.recommendation.opportunity_v2.opportunity_tier} />
+          <OpportunityScoreBadge
+            score={company.recommendation.opportunity_v2.opportunity_score}
+            tier={company.recommendation.opportunity_v2.opportunity_tier}
+          />
+          <ApplicationOrderChip
+            rank={company.recommendation.opportunity_v2.recommended_application_order}
+          />
+        </div>
+      )}
+
       {hasResume &&
         Array.isArray(company.matching_skills) &&
         company.matching_skills.length > 0 && (
@@ -211,20 +351,23 @@ const CompanyCard = ({ company, hasResume }) => {
           </div>
         )}
 
-      <p className="mt-3 flex-1 text-sm italic leading-5 text-gray-700">
+      <p className="mt-3 flex-1 text-sm italic leading-5 text-gray-700 line-clamp-3">
         {company.short_description
           ? `&ldquo;${company.short_description}&rdquo;`
           : '&mdash;'}
       </p>
 
       {!hasResume && (
-        <p className="mt-2.5 rounded-lg border border-dashed border-border-medium bg-background-secondary px-2.5 py-1.5 text-[10px] font-semibold text-gray-700">
+        <p className="mt-2.5 rounded-pipeup border border-dashed border-border-medium bg-background-secondary px-3 py-1.5 text-[10px] font-semibold text-gray-700">
           Upload a resume to personalize.
         </p>
       )}
 
-      <div className="mt-4">
-        <Link to={`/company/${encodeURIComponent(company.name)}`}>
+      <div className="mt-5">
+        <Link
+          to={`/company/${encodeURIComponent(company.name)}`}
+          className="block"
+        >
           <Button size="small" className="w-full">
             View Details
           </Button>
@@ -267,19 +410,42 @@ const Companies = () => {
 
   if (loading) {
     return (
-      <Card>
-        <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
-          <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary-500 border-t-transparent" />
-          <p className="text-sm font-semibold text-gray-800">Loading companies…</p>
-        </div>
-      </Card>
+      <div
+        className="grid gap-5 md:grid-cols-2 lg:grid-cols-3"
+        role="status"
+        aria-label="Loading companies"
+      >
+        {Array.from({ length: 6 }).map((_, i) => (
+          <Card key={i} padding="md" className="space-y-3">
+            <div className="h-5 w-3/4 skeleton" />
+            <div className="h-3 w-1/2 skeleton" />
+            <div className="flex gap-1.5 pt-1">
+              <div className="h-4 w-16 skeleton" />
+              <div className="h-4 w-12 skeleton" />
+            </div>
+            <div className="space-y-1.5 pt-2">
+              <div className="h-3 w-full skeleton" />
+              <div className="h-3 w-5/6 skeleton" />
+            </div>
+          </Card>
+        ))}
+      </div>
     )
   }
 
   if (error) {
     return (
-      <Card className="border-red-500/40 bg-red-500/10">
-        <p className="text-sm font-semibold text-red-700">{error}</p>
+      <Card className="error-state">
+        <div
+          aria-hidden="true"
+          className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-semantic-danger/15 text-semantic-danger"
+        >
+          <Search className="h-6 w-6" />
+        </div>
+        <h3 className="text-base font-bold text-dark-primary">
+          We couldn&rsquo;t load companies.
+        </h3>
+        <p className="max-w-md text-sm font-medium text-gray-700">{error}</p>
       </Card>
     )
   }
@@ -337,13 +503,18 @@ const Companies = () => {
       </Card>
 
       {/* Industry filter chips */}
-      <div className="flex flex-wrap gap-2">
+      <div
+        className="flex flex-wrap gap-2"
+        role="group"
+        aria-label="Filter by industry"
+      >
         {INDUSTRY_FILTERS.map((f) => {
           const active = filter === f.id
           return (
             <button
               key={f.id}
               onClick={() => setFilter(f.id)}
+              aria-pressed={active}
               className={`rounded-pipeup border px-3 py-1.5 text-xs font-bold transition-all duration-pipeup ${
                 active
                   ? 'border-primary-500/40 bg-primary-500/10 text-primary-700 shadow-pipeup'
@@ -359,15 +530,25 @@ const Companies = () => {
       {/* Grid */}
       {visible.length === 0 ? (
         <Card>
-          <div className="flex flex-col items-center justify-center gap-2.5 py-12 text-center">
-            <div className="text-3xl">🔍</div>
-            <p className="text-sm font-semibold text-dark-primary">No companies match your filters.</p>
+          {/* Sprint-9 polish: standardised empty state with premium
+              icon and consistent spacing. */}
+          <div className="empty-state">
+            <span
+              aria-hidden="true"
+              className="inline-flex h-14 w-14 items-center justify-center rounded-full bg-accent-lime/15 text-primary-700 shadow-pipeup"
+            >
+              <Search className="h-7 w-7" aria-hidden="true" />
+            </span>
+            <p className="text-base font-bold text-dark-primary">No companies match your filters.</p>
+            <p className="max-w-sm text-sm text-gray-700">
+              Try clearing the search or broadening the industry filter.
+            </p>
             <button
               onClick={() => {
                 setSearch('')
                 setFilter('all')
               }}
-              className="text-sm font-bold text-primary-700 hover:underline"
+              className="btn-secondary mt-2"
             >
               Clear filters
             </button>

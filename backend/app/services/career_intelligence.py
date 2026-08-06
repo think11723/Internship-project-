@@ -667,10 +667,58 @@ def generate_recommendation(
     # learning_path, suggested_projects, interview_topics, best_team,
     # estimated_interview_difficulty, confidence) into the existing
     # recommendation. Existing keys are preserved; new keys are added.
-    recommendation.update(
-        build_application_strategy(
-            company, resume, enrichment=enrichment, scores=scores
-        )
+    strategy_dict = build_application_strategy(
+        company, resume, enrichment=enrichment, scores=scores
+    )
+    recommendation.update(strategy_dict)
+
+    # Sprint 8: build the complete application package using ALL
+    # available intelligence (resume + company + enrichment + real
+    # jobs + strategy + opportunity). Pure-deterministic — no LLM.
+    # The cover_letter.text is set lazily by /api/documents/generate.
+    from app.services.application_package import build_application_package
+    recommendation["application_package"] = build_application_package(
+        company=company,
+        resume=resume,
+        enrichment=enrichment,
+        jobs=(company.get("job_intelligence") or {}).get("jobs") or [],
+        strategy=strategy_dict,
+        opportunity=recommendation.get("opportunity"),
+    )
+
+    # Sprint 11: build the deterministic recommendation intelligence
+    # (strategy / confidence / reasoning / next_actions / probabilities).
+    # The engine is rule-based and deterministic; LLMs may only polish
+    # the final natural-language strings via the AIGateway.
+    from app.services.recommendation_engine import (
+        build_recommendation_intelligence,
+    )
+    real_jobs = (company.get("job_intelligence") or {}).get("jobs") or []
+    recommendation["intelligence"] = build_recommendation_intelligence(
+        company=company,
+        resume=resume,
+        enrichment=enrichment,
+        jobs=real_jobs,
+        scores=scores,
+    )
+
+    # Sprint 12: build the per-company Opportunity Intelligence v2
+    # record. This is a NEW field (recommendation["opportunity_v2"])
+    # and does NOT modify the existing recommendation["opportunity"]
+    # from Sprint 7. The Opportunity v2 score measures "is this worth
+    # the candidate's time RIGHT NOW" — distinct from Sprint 7's
+    # "should the candidate apply" and Sprint 11's "which strategy
+    # should the candidate use".
+    from app.services.opportunity_intelligence_v2 import (
+        build_opportunity_record,
+    )
+    recommendation["opportunity_v2"] = build_opportunity_record(
+        company=company,
+        resume=resume,
+        enrichment=enrichment,
+        jobs=real_jobs,
+        scores=scores,
+        recommendation=recommendation["intelligence"],
     )
 
     return recommendation

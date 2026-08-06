@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
+import { Award, Calendar, CheckCircle2, Sparkles, Target } from 'lucide-react'
 import Card from '../components/Card'
 import Button from '../components/Button'
 import Loader from '../components/Loader'
@@ -9,6 +11,8 @@ import {
   getResumeLatestAnalysis,
   getUploadStatus,
 } from '../services/resumeService'
+import { getCompanies } from '../services/companyService'
+import { getCareerPlan } from '../services/careerService'
 import { useResume } from '../context/ResumeContext'
 import { useReport } from '../context/ReportContext'
 
@@ -214,6 +218,316 @@ const CurrentResumeCard = ({
         </div>
       </div>
     </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 14.3 — Career Improvement Roadmap.
+//
+// Fetches the companies list and aggregates the per-company
+// ``recommendation.{resume_improvements, interview_prep}`` blocks
+// across the portfolio into a Week 1 / Week 2 / Week 3 timeline.
+// All data comes from the existing recommendation engine — no
+// new endpoints, no new APIs.
+// ---------------------------------------------------------------------------
+
+const CareerImprovementRoadmap = () => {
+  const [companies, setCompanies] = useState([])
+  // Sprint 14.4 — Portfolio progress strip from /api/career-plan.
+  const [planner, setPlanner] = useState(null)
+  const [loading, setLoading] = useState(true)
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([
+      getCompanies({ limit: 200 }).catch(() => ({ data: { companies: [] } })),
+      getCareerPlan().catch(() => null),
+    ])
+      .then(([listRes, careerPlan]) => {
+        if (cancelled) return
+        setCompanies(listRes.data?.companies || [])
+        setPlanner(
+          careerPlan && !careerPlan.requires_resume ? careerPlan : null,
+        )
+      })
+      .finally(() => {
+        if (cancelled) return
+        setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Aggregate missing keywords + ats improvements + bullet coaching
+  // + interview topics across the portfolio. Deduplicate.
+  const missingKeywordsSet = new Set()
+  const atsSet = new Set()
+  const bulletSet = new Set()
+  const topicSet = new Set()
+  const weaknessSet = new Set()
+  for (const c of companies) {
+    const rec = c?.recommendation || {}
+    const ri = rec.resume_improvements || {}
+    for (const k of ri.missing_keywords || []) {
+      if (k) missingKeywordsSet.add(k)
+    }
+    for (const k of ri.ats_improvements || []) {
+      if (k) atsSet.add(k)
+    }
+    for (const k of ri.suggested_bullet_improvements || []) {
+      if (k) bulletSet.add(k)
+    }
+    for (const k of ri.weaknesses || []) {
+      if (k) weaknessSet.add(k)
+    }
+    const ip = rec.interview_prep || {}
+    for (const k of ip.likely_topics || []) {
+      if (k) topicSet.add(k)
+    }
+  }
+  const missingKeywords = [...missingKeywordsSet].slice(0, 6)
+  const ats = [...atsSet].slice(0, 4)
+  const bullets = [...bulletSet].slice(0, 4)
+  const topics = [...topicSet].slice(0, 6)
+  const weaknesses = [...weaknessSet].slice(0, 3)
+
+  if (loading) {
+    return (
+      <Card>
+        <div className="space-y-3" aria-hidden="true">
+          <div className="flex items-center gap-2">
+            <Calendar className="h-4 w-4 text-primary-700" aria-hidden="true" />
+            <p className="text-xs font-bold uppercase tracking-[0.2em] text-primary-700">
+              Career Improvement Roadmap
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div className="h-32 animate-pulse rounded-pipeup bg-background-secondary" />
+            <div className="h-32 animate-pulse rounded-pipeup bg-background-secondary" />
+            <div className="h-32 animate-pulse rounded-pipeup bg-background-secondary" />
+          </div>
+        </div>
+      </Card>
+    )
+  }
+
+  const hasContent =
+    missingKeywords.length > 0 ||
+    ats.length > 0 ||
+    bullets.length > 0 ||
+    topics.length > 0 ||
+    weaknesses.length > 0 ||
+    planner != null
+  if (!hasContent) {
+    return (
+      <Card>
+        <div className="empty-state">
+          <span
+            aria-hidden="true"
+            className="inline-flex h-14 w-14 items-center justify-center rounded-full bg-accent-lime/15 text-primary-700 shadow-pipeup"
+          >
+            <Calendar className="h-7 w-7" aria-hidden="true" />
+          </span>
+          <h3 className="text-lg font-bold text-dark-primary">
+            Generate your weekly report to see a personalised roadmap.
+          </h3>
+          <p className="max-w-md text-sm text-gray-700">
+            The roadmap aggregates coaching notes from every active
+            opportunity and tells you what to improve first.
+          </p>
+          <Link to="/dashboard">
+            <Button size="small">Open Dashboard</Button>
+          </Link>
+        </div>
+      </Card>
+    )
+  }
+
+  return (
+    <Card className="border-primary-500/30">
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <Calendar className="h-4 w-4 text-primary-700" aria-hidden="true" />
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-primary-700">
+            Career Improvement Roadmap
+          </p>
+        </div>
+
+        {/* Sprint 14.4 — Portfolio progress strip from
+            /api/career-plan. Sits between the section header and
+            the Week columns so the user reads "where do I stand"
+            before "what do I improve". */}
+        {planner && <PortfolioProgressStrip planner={planner} />}
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <RoadmapColumn
+            label="Week 1"
+            title="Resume bullets"
+            icon={Sparkles}
+            iconClass="text-amber-700"
+            items={bullets}
+          />
+          <RoadmapColumn
+            label="Week 2"
+            title="Priority skills"
+            icon={Target}
+            iconClass="text-primary-700"
+            items={missingKeywords.map((k) => `Add "${k}" to your skills section`)}
+          />
+          <RoadmapColumn
+            label="Week 3"
+            title="Interview topics"
+            icon={Award}
+            iconClass="text-emerald-600"
+            items={topics}
+          />
+        </div>
+
+        {(weaknesses.length > 0 || ats.length > 0) && (
+          <div className="border-t border-border-medium pt-3">
+            <p className="text-[10px] font-bold uppercase tracking-widest text-gray-700">
+              Resume weaknesses to address
+            </p>
+            <ul className="mt-2 space-y-1.5">
+              {[...weaknesses, ...ats].slice(0, 6).map((w, i) => (
+                <li
+                  key={i}
+                  className="flex items-start gap-2 text-xs font-medium leading-5 text-dark-primary"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-red-500/20 text-red-700"
+                  >
+                    <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3} aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M5.07 19h13.86a2 2 0 001.74-3L13.74 4a2 2 0 00-3.48 0L3.34 16a2 2 0 001.73 3z" />
+                    </svg>
+                  </span>
+                  <span>{w}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </Card>
+  )
+}
+
+// Sprint 14.4 — Portfolio progress strip rendered above the Week
+// columns on the Resume page. Surfaces the weekly goal, estimated
+// hours, and the high/medium/long/total portfolio counts from
+// /api/career-plan.
+const PortfolioProgressStrip = ({ planner }) => {
+  const portfolio = planner?.portfolio || {}
+  const counts = [
+    {
+      label: 'High priority',
+      value: portfolio.high_priority_count || 0,
+      tone:
+        'border-emerald-500/40 bg-emerald-500/10 text-emerald-700',
+    },
+    {
+      label: 'Medium',
+      value: portfolio.medium_priority_count || 0,
+      tone: 'border-primary-500/40 bg-primary-500/10 text-primary-700',
+    },
+    {
+      label: 'Long term',
+      value: portfolio.long_term_count || 0,
+      tone: 'border-amber-500/40 bg-amber-500/10 text-amber-800',
+    },
+    {
+      label: 'Total',
+      value: portfolio.total_companies || 0,
+      tone:
+        'border-border-medium bg-background-secondary text-gray-800',
+    },
+  ]
+  return (
+    <div className="space-y-2 rounded-pipeup border border-border-light bg-background-secondary p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[10px] font-bold uppercase tracking-widest text-gray-700">
+          Portfolio progress
+        </p>
+        {typeof planner?.estimated_hours_required === 'number' &&
+          planner.estimated_hours_required > 0 && (
+            <span className="rounded-full border border-primary-500/40 bg-primary-500/10 px-2.5 py-0.5 text-[10px] font-bold text-primary-700">
+              ~{planner.estimated_hours_required}h this week
+            </span>
+          )}
+      </div>
+      {planner?.weekly_goal && (
+        <p className="text-xs font-medium leading-5 text-dark-primary">
+          <span className="font-semibold">Weekly goal:</span>{' '}
+          {planner.weekly_goal}
+        </p>
+      )}
+      <div className="grid grid-cols-4 gap-2">
+        {counts.map((c) => (
+          <div
+            key={c.label}
+            className={`rounded-pipeup border px-2.5 py-1.5 text-center ${c.tone}`}
+            title={c.label}
+          >
+            <p className="text-[9px] font-bold uppercase tracking-widest opacity-80">
+              {c.label}
+            </p>
+            <p className="mt-0.5 text-lg font-bold leading-none">{c.value}</p>
+          </div>
+        ))}
+      </div>
+      {portfolio.text && (
+        <p className="text-[11px] font-medium leading-5 text-gray-700">
+          {portfolio.text}
+        </p>
+      )}
+    </div>
+  )
+}
+
+const RoadmapColumn = ({ label, title, icon: Icon, iconClass, items }) => {
+  if (!items || items.length === 0) {
+    return (
+      <div className="rounded-pipeup border border-border-light bg-background-secondary p-3.5">
+        <div className="flex items-center gap-2">
+          <Icon className={`h-4 w-4 ${iconClass}`} aria-hidden="true" />
+          <p className="text-[10px] font-bold uppercase tracking-widest text-gray-700">
+            {label}
+          </p>
+        </div>
+        <p className="mt-2 text-sm font-bold text-dark-primary">{title}</p>
+        <p className="mt-1.5 text-xs font-medium leading-5 text-gray-700">
+          No suggestions yet — generate the weekly report to populate.
+        </p>
+      </div>
+    )
+  }
+  return (
+    <div className="rounded-pipeup border border-border-light bg-background-secondary p-3.5">
+      <div className="flex items-center gap-2">
+        <Icon className={`h-4 w-4 ${iconClass}`} aria-hidden="true" />
+        <p className="text-[10px] font-bold uppercase tracking-widest text-gray-700">
+          {label}
+        </p>
+      </div>
+      <p className="mt-1.5 text-sm font-bold text-dark-primary">{title}</p>
+      <ul className="mt-2 space-y-1.5">
+        {items.slice(0, 5).map((item, i) => (
+          <li
+            key={i}
+            className="flex items-start gap-2 text-xs font-medium leading-5 text-dark-primary"
+          >
+            <span
+              aria-hidden="true"
+              className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded border-2 border-primary-500/40 bg-background-card text-[9px] font-bold text-primary-700"
+            >
+              {i + 1}
+            </span>
+            <span>{item}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   )
 }
 
@@ -551,6 +865,11 @@ const ResumeUpload = () => {
           </Card>
         )}
 
+        {/* Sprint 14.3 — Career Improvement Roadmap.
+            Sits below the AI Recommended Roles card so the resume
+            review reads top-down: who am I → what to improve. */}
+        <CareerImprovementRoadmap />
+
         {analysis.extractedText && (
           <Card>
             <div className="space-y-3">
@@ -568,8 +887,11 @@ const ResumeUpload = () => {
   }
 
   return (
-    <div className="space-y-5">
-      <h1 className="text-2xl font-bold text-dark-primary">Resume Analysis</h1>
+    <div className="space-y-6">
+      <div className="flex flex-col gap-1">
+        <p className="text-eyebrow">Resume</p>
+        <h1 className="text-display-sm">Resume Analysis</h1>
+      </div>
 
       {/* Current Resume Management Card */}
       {currentResume && !file && !uploading && !viewingResume && (
@@ -772,41 +1094,46 @@ const ResumeUpload = () => {
         </div>
       )}
 
-      {/* Info Card */}
-      <Card>
-        <h3 className="mb-3 text-base font-bold text-dark-primary">
-          What will be analyzed:
-        </h3>
-        <div className="grid grid-cols-2 gap-3 text-sm font-medium text-gray-700">
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Personal information</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Skills & technologies</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Work experience</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Education background</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Projects</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Certifications</span>
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-primary-700 font-bold">•</span>
-            <span>Key strengths</span>
-          </div>
+      {/* Info Card — Sprint-9 polish: stronger hierarchy, premium icon row,
+          soft hover highlight, and a top accent stripe to make this
+          section feel important without becoming loud. */}
+      <Card className="relative overflow-hidden">
+        <span
+          aria-hidden="true"
+          className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-accent-lime/0 via-accent-lime/70 to-accent-lime/0"
+        />
+        <div className="mb-4 flex items-center gap-2">
+          <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-accent-lime/15 text-primary-700">
+            <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+          </span>
+          <h3 className="text-sm font-bold uppercase tracking-widest text-gray-700">
+            What will be analyzed
+          </h3>
         </div>
+        <ul className="grid grid-cols-1 gap-1 sm:grid-cols-2 sm:gap-2">
+          {[
+            'Personal information',
+            'Skills & technologies',
+            'Work experience',
+            'Education background',
+            'Projects',
+            'Certifications',
+            'Key strengths',
+          ].map((item) => (
+            <li
+              key={item}
+              className="group flex items-center gap-2.5 rounded-pipeup border border-transparent px-3 py-2 text-sm font-medium text-gray-700 transition-all duration-pipeup ease-out hover:border-accent-lime/40 hover:bg-accent-lime/5 hover:text-dark-primary"
+            >
+              <span
+                aria-hidden="true"
+                className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-primary-100 text-primary-700 transition-colors duration-pipeup group-hover:bg-accent-lime group-hover:text-dark-primary"
+              >
+                <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+              </span>
+              <span>{item}</span>
+            </li>
+          ))}
+        </ul>
       </Card>
     </div>
   )

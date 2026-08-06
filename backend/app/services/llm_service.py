@@ -1,102 +1,94 @@
-"""LLM service backed by OpenRouter via the OpenAI SDK.
+"""Sprint 9 — LLM service routed through the AIGateway.
 
-OpenRouter exposes an OpenAI-compatible API, so we reuse the official
-``openai`` Python SDK and only change the transport configuration
-(base_url, api_key, model). All public methods keep their original
-signatures; only the network call has been migrated.
+The application no longer talks to OpenAI / OpenRouter / Groq /
+Cerebras directly. Every LLM call goes through
+``app.services.ai_gateway.get_gateway()``, which tries each
+configured provider in priority order and falls back on
+retryable failures.
+
+Backward compatibility:
+  - ``LLMService()`` constructor accepts no arguments (settings are
+    read from the gateway, not from env directly).
+  - ``LLMService.generate_cover_letter(candidate, company,
+    extra_context="")`` is the public method the cover-letter route
+    already calls. It still works.
+  - The ``client`` attribute is preserved for any code that imports
+    it directly. It is a ``AIGateway`` instance, not an OpenAI
+    client. The two objects share a small surface (``.chat``,
+    ``.completions``), but callers that relied on OpenAI-specific
+    methods should be migrated to use ``AIGateway`` directly.
+
+If the gateway returns ``None`` (every provider failed or none
+configured), the cover-letter endpoint returns 503 — exactly the
+same behaviour as the previous OpenRouter failure path.
 """
+from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-import httpx
-from openai import OpenAI
+from app.services.ai_gateway import AIGateway, get_gateway
 
-from app.core.config import settings
-
-logger = logging.getLogger("fundflow")
+logger = logging.getLogger("fundflow.llm_service")
 
 
 class LLMService:
-    """LLM service routed through OpenRouter.
+    """LLM service routed through the AIGateway.
 
-    Two public methods are exposed:
-
-    - ``generate_cover_letter(candidate, company)``: produces a plain-text
-      cover letter using a deterministic prompt built into this class.
-    - ``client``: the raw OpenAI client, exposed for callers that need
-      bespoke prompts and parsing (e.g. ``discovery_service`` for
-      company normalization).
+    Two public methods:
+      - ``generate_cover_letter(candidate, company, extra_context="")``
+        returns the body of a personalised cover letter, or ``None``
+        if every provider failed.
+      - ``client``: the underlying ``AIGateway`` instance, exposed for
+        callers that need bespoke prompts (e.g. the weekly discovery
+        enrichment path).
     """
 
     def __init__(self) -> None:
-        """Initialize the OpenAI SDK pointed at OpenRouter.
-
-        We pass a pre-built ``httpx.Client`` via the ``http_client``
-        kwarg to avoid the legacy ``proxies=`` argument that
-        ``openai==1.3.7`` passes internally and that ``httpx>=0.28``
-        no longer accepts.
-
-        Raises:
-            ValueError: if ``OPENROUTER_API_KEY`` is not configured.
-        """
-        if not settings.OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY not configured")
-        self.client = OpenAI(
-            api_key=settings.OPENROUTER_API_KEY,
-            base_url=settings.OPENROUTER_BASE_URL,
-            http_client=httpx.Client(timeout=180.0),
-        )
-
-    def _model(self) -> str:
-        """Return the configured OpenRouter model name."""
-        return settings.OPENROUTER_MODEL
+        # Lazily build the gateway (only the first time it's needed).
+        # The application may set the provider order at runtime via
+        # ``get_gateway().set_enabled(name, bool)``.
+        self.client: AIGateway = get_gateway()
 
     def generate_cover_letter(
         self,
         candidate: Dict[str, Any],
         company: Dict[str, Any],
-    ) -> str:
-        """Generate a personalized cover letter via OpenRouter.
+        extra_context: str = "",
+    ) -> Optional[str]:
+        """Generate a personalised cover letter via the AIGateway.
 
         Args:
             candidate: Candidate profile dict (name, summary, skills, ...).
             company: Target company dict (name, tagline, industry, ...).
+            extra_context: Optional Sprint 8 context string built by
+                ``application_package.build_application_package``.
 
         Returns:
-            The cover letter body as plain text.
-
-        Raises:
-            Exception: any underlying provider / network error, so
-                callers can log and degrade gracefully.
+            The cover letter body as plain text, or ``None`` if every
+            provider failed or the gateway is not configured.
         """
-        prompt = self._build_cover_letter_prompt(candidate, company)
-
+        prompt = self._build_cover_letter_prompt(
+            candidate, company, extra_context
+        )
         try:
-            response = self.client.chat.completions.create(
-                model=self._model(),
-                messages=[{"role": "user", "content": prompt}],
-            )
-        except Exception as exc:
-            logger.error("Cover letter OpenRouter call failed: %s", exc)
-            raise
-
-        content = ""
-        for choice in getattr(response, "choices", []) or []:
-            message = getattr(choice, "message", None)
-            if message is not None and getattr(message, "content", None):
-                content = message.content
-                break
-
+            content = self.client.generate(prompt)
+        except Exception as exc:  # defensive — gateway already swallows
+            logger.error("Cover letter gateway call failed: %s", exc)
+            return None
         if not content:
-            logger.error("Cover letter generation returned empty content")
+            logger.warning(
+                "Cover letter generation returned empty content "
+                "(gateway returned None or empty)"
+            )
+            return None
         return content.strip()
 
     def _build_cover_letter_prompt(
         self,
         candidate: Dict[str, Any],
         company: Dict[str, Any],
+        extra_context: str = "",
     ) -> str:
         """Build the cover-letter generation prompt.
 
@@ -116,7 +108,7 @@ class LLMService:
         tagline = (company.get("tagline") or "").strip() or "(no tagline)"
         industry = (company.get("industry") or "").strip() or "(no industry)"
 
-        return f"""You are a professional career writer helping a candidate write a personalized cover letter.
+        prompt = f"""You are a professional career writer helping a candidate write a personalized cover letter.
 
 Write a cover letter for the candidate and target company below. The letter must be specific to this candidate and this company — never generic.
 
@@ -142,3 +134,8 @@ STRICT REQUIREMENTS
 - Write in the candidate's own voice — natural and specific, not robotic
 
 Return ONLY the letter body. No commentary, no labels, no code fences."""
+
+        if extra_context:
+            prompt += "\n\n" + extra_context
+
+        return prompt

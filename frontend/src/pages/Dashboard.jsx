@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { BarChart3, FileText } from 'lucide-react'
 import Card from '../components/Card'
 import Button from '../components/Button'
 import CoverLetterCard from '../components/CoverLetterCard'
 import { generateWeeklyReport } from '../services/workflowService'
 import { getCompanies } from '../services/companyService'
+import { getCareerPlan } from '../services/careerService'
 import { useReport } from '../context/ReportContext'
 import { useResume } from '../context/ResumeContext'
 
@@ -237,12 +239,264 @@ const buildSnapshot = (report) => {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sprint 14.3 — Today's Action Plan aggregate.
+//
+// Every company in the list response carries a
+// ``recommendation.action_plan`` block (today / this_week /
+// next_month / roadmap). We pick the highest-priority company
+// (best opportunity score + a strategy that signals "act now")
+// as the "next application target", collect the first three
+// "today" tasks from across the portfolio, count pending
+// actions, and surface the roadmap narrative.
+//
+// Pure helper — no React, no side effects.
+// ---------------------------------------------------------------------------
+
+const HIGH_ACTION_STRATEGIES = new Set([
+  'Apply Immediately',
+  'Apply This Week',
+  'Connect on LinkedIn First',
+  'Cold Email Founder',
+])
+
+function _opportunityScoreOf(company) {
+  return company?.recommendation?.opportunity_v2?.opportunity_score ?? 0
+}
+
+function _strategyOf(company) {
+  return company?.recommendation?.intelligence?.strategy || ''
+}
+
+function _actionPlanOf(company) {
+  return company?.recommendation?.action_plan || null
+}
+
+function aggregateActionPlans(companies) {
+  if (!Array.isArray(companies) || companies.length === 0) return null
+
+  // Rank by: HIGH-action strategy first, then opportunity score desc.
+  const ranked = [...companies].sort((a, b) => {
+    const aAct = HIGH_ACTION_STRATEGIES.has(_strategyOf(a)) ? 1 : 0
+    const bAct = HIGH_ACTION_STRATEGIES.has(_strategyOf(b)) ? 1 : 0
+    if (aAct !== bAct) return bAct - aAct
+    return _opportunityScoreOf(b) - _opportunityScoreOf(a)
+  })
+
+  const top = ranked[0]
+
+  // Aggregate today's + this_week tasks across the portfolio.
+  const todayTasks = []
+  const thisWeekTasks = []
+  for (const c of ranked) {
+    const plan = _actionPlanOf(c)
+    if (!plan) continue
+    for (const t of plan.today || []) {
+      if (!todayTasks.includes(t) && todayTasks.length < 3) {
+        todayTasks.push(t)
+      }
+    }
+    for (const t of plan.this_week || []) {
+      if (!thisWeekTasks.includes(t) && thisWeekTasks.length < 3) {
+        thisWeekTasks.push(t)
+      }
+    }
+    if (todayTasks.length >= 3 && thisWeekTasks.length >= 3) break
+  }
+
+  const pendingCount = todayTasks.length + thisWeekTasks.length
+  const roadmap =
+    _actionPlanOf(top)?.roadmap ||
+    'Generate the weekly report to unlock your personalised roadmap.'
+
+  return {
+    topCompany: {
+      name: top.name,
+      strategy: _strategyOf(top),
+      opportunityScore: _opportunityScoreOf(top),
+    },
+    todayTasks,
+    thisWeekTasks,
+    pendingCount,
+    roadmap,
+  }
+}
+
+// Sprint 14.3 — Today's Action Plan card. Compact summary of the
+// portfolio-wide action plan. Renders nothing when there's no
+// resume / no action plan — keeps the dashboard clean.
+const TodaysActionPlan = ({ plan }) => {
+  if (!plan || plan.pendingCount === 0) return null
+  const {
+    topCompany,
+    todayTasks,
+    thisWeekTasks,
+    pendingCount,
+    roadmap,
+    // Sprint 14.4 — portfolio-level fields from /api/career-plan
+    weeklyGoal,
+    estimatedHours,
+    portfolioText,
+    portfolioCounts,
+  } = plan
+  return (
+    <Card className="border-accent-lime/40 bg-gradient-to-br from-accent-lime/10 via-primary-500/5 to-accent-lime/5">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="space-y-1">
+            <p className="text-[10px] font-bold uppercase tracking-widest text-primary-700">
+              Today&apos;s Action Plan
+            </p>
+            <h3 className="text-base font-bold text-dark-primary">
+              Next application target:{' '}
+              {topCompany?.name ? (
+                <Link
+                  to={`/company/${encodeURIComponent(topCompany.name)}`}
+                  className="text-primary-700 underline-offset-2 hover:underline"
+                >
+                  {topCompany.name}
+                </Link>
+              ) : (
+                '—'
+              )}
+            </h3>
+            {weeklyGoal && (
+              <p className="mt-1 text-xs font-medium leading-5 text-gray-700">
+                <span className="font-semibold text-dark-primary">Weekly goal:</span>{' '}
+                {weeklyGoal}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {typeof estimatedHours === 'number' && estimatedHours > 0 && (
+              <span className="rounded-full border border-primary-500/40 bg-primary-500/10 px-3 py-1 text-xs font-bold text-primary-700">
+                ~{estimatedHours}h this week
+              </span>
+            )}
+            <span className="rounded-full border border-accent-lime/50 bg-accent-lime/20 px-3 py-1 text-xs font-bold text-primary-700">
+              {pendingCount} pending
+            </span>
+          </div>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="rounded-pipeup border border-border-light bg-background-card/70 p-3">
+            <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-700">
+              Today
+            </p>
+            <ul className="mt-2 space-y-1.5">
+              {todayTasks.length === 0 ? (
+                <li className="text-xs font-medium text-gray-700">
+                  No urgent tasks — keep momentum with weekly goals.
+                </li>
+              ) : (
+                todayTasks.map((t, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs font-medium leading-5 text-dark-primary">
+                    <span
+                      aria-hidden="true"
+                      className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded border-2 border-primary-500/40 bg-background-card text-[9px] font-bold text-primary-700"
+                    >
+                      {i + 1}
+                    </span>
+                    <span>{typeof t === 'string' ? t : t.action}</span>
+                  </li>
+                ))
+              )}
+            </ul>
+          </div>
+          <div className="rounded-pipeup border border-border-light bg-background-card/70 p-3">
+            <p className="text-[10px] font-bold uppercase tracking-widest text-primary-700">
+              This Week
+            </p>
+            <ul className="mt-2 space-y-1.5">
+              {thisWeekTasks.length === 0 ? (
+                <li className="text-xs font-medium text-gray-700">
+                  Plan loading — generate your weekly report.
+                </li>
+              ) : (
+                thisWeekTasks.map((t, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs font-medium leading-5 text-dark-primary">
+                    <span
+                      aria-hidden="true"
+                      className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-primary-500/15 text-[9px] font-bold text-primary-700"
+                    >
+                      {i + 1}
+                    </span>
+                    <span>{typeof t === 'string' ? t : t.action}</span>
+                  </li>
+                ))
+              )}
+            </ul>
+          </div>
+        </div>
+
+        {portfolioCounts && (
+          <PortfolioSummaryStrip counts={portfolioCounts} text={portfolioText} />
+        )}
+
+        <p className="text-xs font-medium leading-5 text-gray-700">
+          <span className="font-semibold text-dark-primary">Roadmap:</span> {roadmap}
+        </p>
+      </div>
+    </Card>
+  )
+}
+
+// Sprint 14.4 — compact 4-tile strip showing the portfolio counts
+// (high / medium / long-term / total). Sits inside the Today's
+// Action Plan card. Each count is a clickable Link to the
+// companies list filtered by tier (when applicable).
+const PortfolioSummaryStrip = ({ counts, text }) => {
+  if (!counts) return null
+  const tiles = [
+    { key: 'high', label: 'High priority', value: counts.high, tone: 'text-emerald-700 border-emerald-500/40 bg-emerald-500/10' },
+    { key: 'medium', label: 'Medium', value: counts.medium, tone: 'text-primary-700 border-primary-500/40 bg-primary-500/10' },
+    { key: 'long', label: 'Long term', value: counts.long, tone: 'text-amber-700 border-amber-500/40 bg-amber-500/10' },
+    { key: 'total', label: 'Total', value: counts.total, tone: 'text-gray-800 border-border-medium bg-background-secondary' },
+  ]
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-4 gap-2">
+        {tiles.map((t) => (
+          <div
+            key={t.key}
+            className={`rounded-pipeup border px-3 py-2 text-center ${t.tone}`}
+            title={t.label}
+          >
+            <p className="text-[9px] font-bold uppercase tracking-widest opacity-80">
+              {t.label}
+            </p>
+            <p className="mt-0.5 text-xl font-bold leading-none">
+              {t.value || 0}
+            </p>
+          </div>
+        ))}
+      </div>
+      {text && (
+        <p className="text-xs font-medium leading-5 text-gray-700">{text}</p>
+      )}
+    </div>
+  )
+}
+
 const Dashboard = () => {
   const { report, setReport, clearReport, hasReport } = useReport()
   const { currentResume } = useResume()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [activeStage, setActiveStage] = useState(0)
+
+  // Sprint 14.3 — Today's Action Plan aggregate. The list
+  // endpoint is the only place where per-company
+  // ``recommendation.action_plan`` lives. We fetch the list in
+  // parallel with the resume-context mount and aggregate the
+  // top-priority items across the portfolio. State stays null
+  // until either a resume is uploaded or the report runs.
+  // Sprint 14.4 — also fetch GET /api/career-plan for the
+  // portfolio-level planner fields (weekly_goal, hours, portfolio
+  // summary). Both payloads are combined into the actionPlan
+  // state below.
+  const [actionPlan, setActionPlan] = useState(null)
 
   // Whether the empty state should be shown. A resume in the context
   // means the user has uploaded one — even if the workflow has not yet
@@ -253,6 +507,55 @@ const Dashboard = () => {
   // (The old on-mount `getCompanies({limit:1})` check is no longer needed:
   // ResumeContext loads the latest resume metadata on mount and exposes
   // it via useResume().)
+
+  // Sprint 14.3 — fetch the companies list when a resume is uploaded
+  // and aggregate the per-company ``action_plan`` into a single
+  // Today's Action Plan summary. We do this lazily on resume change
+  // so the dashboard render path stays fast.
+  // Sprint 14.4 — fetch /api/career-plan in parallel and merge its
+  // portfolio-level fields (weekly_goal, estimated_hours_required,
+  // portfolio summary) into the actionPlan state.
+  useEffect(() => {
+    if (!currentResume) {
+      setActionPlan(null)
+      return
+    }
+    let cancelled = false
+    Promise.all([
+      getCompanies({ limit: 200 }),
+      getCareerPlan(),
+    ])
+      .then(([listRes, careerPlan]) => {
+        if (cancelled) return
+        const aggregated = aggregateActionPlans(listRes.data?.companies || [])
+        if (careerPlan && !careerPlan.requires_resume) {
+          setActionPlan({
+            ...aggregated,
+            weeklyGoal: careerPlan.weekly_goal || '',
+            estimatedHours: careerPlan.estimated_hours_required || 0,
+            portfolioText: careerPlan.portfolio?.text || '',
+            portfolioCounts: {
+              high: careerPlan.portfolio?.high_priority_count || 0,
+              medium: careerPlan.portfolio?.medium_priority_count || 0,
+              long: careerPlan.portfolio?.long_term_count || 0,
+              total: careerPlan.portfolio?.total_companies || 0,
+            },
+            highPriorityNames: careerPlan.high_priority_companies || [],
+            mediumPriorityNames: careerPlan.medium_priority_companies || [],
+            longTermNames: careerPlan.long_term_targets || [],
+          })
+        } else {
+          setActionPlan(aggregated)
+        }
+      })
+      .catch(() => {
+        if (cancelled) return
+        setActionPlan(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [currentResume])
 
   useEffect(() => {
     if (!loading) return
@@ -300,7 +603,7 @@ const Dashboard = () => {
   const progressPercent = ((activeStage + 1) / WORKFLOW_STAGES.length) * 100
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       {/* Header */}
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
         <div>
@@ -392,6 +695,13 @@ const Dashboard = () => {
               </p>
             </div>
           </Card>
+
+          {/* Sprint 14.3 — Today's Action Plan.
+              Sits directly below the hero card so the user reads
+              "what to do right now" before the deeper market and
+              opportunity sections. Renders nothing when there's no
+              resume or the action plan is empty. */}
+          <TodaysActionPlan plan={actionPlan} />
 
           {/* SECTION 1.5 - Market Intelligence (Ticket-014) */}
           {report.market_summary && (
@@ -650,8 +960,15 @@ const Dashboard = () => {
 
       {!report && !loading && !error && !requiresResume && (
         <Card>
-          <div className="flex flex-col items-center justify-center gap-2.5 py-12 text-center">
-            <div className="text-4xl">📊</div>
+          {/* Sprint-9 polish: standardised empty state with a premium
+              icon container and consistent spacing. */}
+          <div className="empty-state">
+            <span
+              aria-hidden="true"
+              className="inline-flex h-14 w-14 items-center justify-center rounded-full bg-accent-lime/15 text-primary-700 shadow-pipeup"
+            >
+              <BarChart3 className="h-7 w-7" aria-hidden="true" />
+            </span>
             <h3 className="text-lg font-bold text-dark-primary">
               Your Executive Dashboard Awaits
             </h3>
@@ -664,13 +981,18 @@ const Dashboard = () => {
 
       {requiresResume && !loading && (
         <Card>
-          <div className="flex flex-col items-center justify-center gap-3 py-12 text-center">
-            <div className="text-4xl">📄</div>
+          <div className="empty-state">
+            <span
+              aria-hidden="true"
+              className="inline-flex h-14 w-14 items-center justify-center rounded-full bg-accent-lime/15 text-primary-700 shadow-pipeup"
+            >
+              <FileText className="h-7 w-7" aria-hidden="true" />
+            </span>
             <h3 className="text-lg font-bold text-dark-primary">No resume uploaded yet</h3>
             <p className="max-w-md text-sm text-gray-700">
               Upload your resume to generate your first AI Career Report.
             </p>
-            <Link to="/resume" className="mt-1">
+            <Link to="/resume">
               <Button size="small">Upload Resume</Button>
             </Link>
           </div>

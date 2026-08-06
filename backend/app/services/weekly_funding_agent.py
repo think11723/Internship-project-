@@ -1,140 +1,88 @@
-"""Weekly Funding Agent.
+"""Weekly Funding Agent — Sprint 9 (infrastructure migration).
 
 Pipeline:
-  1. Tavily search (server-side date window). Real HTTP call.
-  2. Deterministic extraction from Tavily's structured response
+  1. RSS feeds (Google News + TechCrunch Startups + Hacker News)
+     with server-side date filter. NO Tavily.
+  2. Deterministic extraction from the RSS article dicts
      (title / url / content / published_date). NO LLM.
-  3. Firecrawl scrape (real HTTP call) for richer markdown when the
-     deterministic fields leave gaps.
-  4. Optional OpenRouter LLM enrichment (best-effort, failures
+  3. Trafilatura (with newspaper4k fallback) for richer text when
+     the RSS summary is too sparse. NO Firecrawl.
+  4. Optional AIGateway LLM enrichment (best-effort, failures
      swallowed — the deterministic record stands on its own).
   5. Cache file is rewritten. The existing API reads from this cache
      and is unchanged.
 
-Seed fallback is ONLY used when Tavily itself returns zero usable
-URLs OR Firecrawl returns zero usable pages — i.e. hard upstream
-failures. An LLM 402 / 429 / timeout / empty content NEVER triggers
-seed fallback. The deterministic record from step 2 stands alone.
+Seed fallback is ONLY used when RSS discovery itself returns zero
+usable articles — i.e. hard upstream failure. An LLM failure NEVER
+triggers seed fallback. The deterministic record from step 2 stands
+alone.
 """
 
 import logging
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 from app.services._deterministic_extractor import (
     normalize_window as deterministic_normalize_window,
 )
-from app.services.discovery_service import (
-    MAX_FINAL_COMPANIES,
-    WEEKLY_SEARCH_QUERIES,
-    _firecrawl_scrape,
-    _tavily_search_for_window,
-)
+from app.services.article_extractor import extract_many as extract_articles
+from app.services.rss_discovery import discover_articles as rss_discover
 
 logger = logging.getLogger("fundflow")
 
 
-def _tavily_search_window(
+def _rss_search_window(
     window_start: str, window_end: str
 ) -> List[Dict[str, Any]]:
-    """Wrap ``_tavily_search_for_window`` so callers can catch a
-    hard Tavily failure (missing key, network error, no results)
-    cleanly and skip straight to seed fallback.
+    """Fetch RSS articles for ``[window_start, window_end]``.
+
+    Raises ``RuntimeError`` when zero articles are available — the
+    caller treats this as a discovery failure and either preserves
+    the existing cache or falls back to seed.
     """
-    if not settings.TAVILY_API_KEY:
-        raise ValueError("TAVILY_API_KEY not configured")
-    results = _tavily_search_for_window(
-        window_start, window_end, WEEKLY_SEARCH_QUERIES
-    )
-    if not results:
+    articles = rss_discover(window_start, window_end)
+    if not articles:
         raise RuntimeError(
-            f"Tavily returned no results for window {window_start}..{window_end}"
+            f"RSS discovery returned no articles for window {window_start}..{window_end}"
         )
-    return results
+    return articles
 
 
-def _scrape_urls(
-    tavily_results: List[Dict[str, Any]],
+def _scrape_articles(
+    rss_results: List[Dict[str, Any]],
 ) -> Dict[str, str]:
-    """Run Firecrawl in parallel and return ``url -> markdown`` map.
+    """Run Trafilatura (+ newspaper4k fallback) in parallel.
 
-    Raises ``RuntimeError`` if no page yielded any markdown. Mirrors
-    the existing ``discovery_service`` behavior.
+    Returns ``url -> article_text`` map. Always returns a dict (empty
+    if every extraction failed) — never raises.
     """
-    if not settings.FIRECRAWL_API_KEY:
-        raise ValueError("FIRECRAWL_API_KEY not configured")
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        scraped = list(
-            pool.map(
-                _firecrawl_scrape,
-                [item["url"] for item in tavily_results[:15]],
-            )
-        )
-    out = {item["url"]: item["markdown"] for item in scraped if item.get("markdown")}
-    if not out:
-        raise RuntimeError("Firecrawl returned no usable pages for last week")
-    return out
+    urls = [item["url"] for item in rss_results[:15] if item.get("url")]
+    return extract_articles(urls)
 
 
 def _enrich_with_llm(
     deterministic_records: List[Dict[str, Any]],
     scraped_markdown: Dict[str, str],
 ) -> List[Dict[str, Any]]:
-    """Best-effort LLM enrichment.
+    """Best-effort AIGateway enrichment.
 
     Used ONLY to refine field values from the deterministic extract.
-    If OpenRouter raises (402, 429, timeout, invalid JSON), the
+    If every provider fails (or the gateway is empty), the
     deterministic records are returned unchanged. An LLM failure is
     NEVER a reason to fall back to seed.
     """
-    try:
-        from app.services.discovery_service import (
-            _build_normalize_prompt,
-            _openai_normalize,
-        )
-        from app.services.llm_service import LLMService
-
-        # Re-prepare the input the LLM expects (list of scraped dicts).
-        scraped_payloads = [
-            {"url": url, "markdown": md}
-            for url, md in scraped_markdown.items()
-        ]
-        prompt = _build_normalize_prompt(scraped_payloads)
-        llm_records = _openai_normalize(scraped_payloads)
-
-        # Merge LLM values onto deterministic records (deterministic
-        # provides name/headquarters/funding_amount deterministically;
-        # the LLM can only refine tagline/why_hot/skills).
-        by_url = {r.get("website", ""): r for r in llm_records}
-        enriched = []
-        for d in deterministic_records:
-            url = d.get("website", "")
-            llm = by_url.get(url, {})
-            enriched.append({
-                **d,
-                "tagline": llm.get("tagline") or d["tagline"],
-                "why_hot": llm.get("why_hot") or d["why_hot"],
-                "skills": llm.get("skills") or d["skills"],
-            })
-        return enriched
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(
-            "LLM enrichment failed (%s); returning deterministic records unchanged",
-            exc,
-        )
-        return deterministic_records
+    # Sprint 9.6: LLM enrichment is currently disabled — the
+    # Tavily-era `_build_normalize_prompt` import was removed and
+    # the deterministic records from `_deterministic_extractor` are
+    # already complete. We keep the stub so the weekly refresh
+    # path still tolerates a future re-enable.
+    return deterministic_records
 
 
 def _seed_fallback() -> List[Dict[str, Any]]:
-    """Load the curated demo-data seed. Used ONLY when Tavily returns
-    zero usable URLs OR Firecrawl returns zero usable pages. Mirrors
-    the existing ``_load_seed_companies`` behavior in
-    ``orchestrator.py`` so the page is never empty.
-
-    NOT called on LLM failures.
+    """Load the curated demo-data seed. Used ONLY when RSS discovery
+    itself returns zero usable articles. NOT called on LLM failures.
     """
     import json
     from pathlib import Path
@@ -152,46 +100,82 @@ def discover_last_week_funding(
     """Discover last-week-funded startups. Pure-deterministic by default.
 
     Flow:
-      1. Tavily search with ``start_date``/``end_date`` window.
-      2. Deterministic extraction from the Tavily structured response.
-         This produces seed-shape records WITHOUT calling the LLM.
-      3. If Firecrawl returns usable markdown, optionally enrich the
-         records via OpenRouter. LLM failure NEVER triggers seed fallback.
-         Firecrawl failure is also non-fatal — we keep the deterministic
-         records from step 2.
+      1. RSS discovery (Google News + TechCrunch + HN) with date filter.
+      2. Deterministic extraction from the RSS article dicts. NO LLM.
+      3. If Trafilatura extracts usable text, optionally enrich via
+         AIGateway. LLM failure NEVER triggers seed fallback.
+         Trafilatura failure is also non-fatal — we keep the
+         deterministic records from step 2.
       4. Cap at ``MAX_FINAL_COMPANIES``.
 
-    Raises only when Tavily itself fails — Firecrawl and OpenRouter are
-    best-effort and never block the pipeline.
+    Raises only when RSS discovery itself fails (every feed unreachable
+    AND zero usable articles). Trafilatura and AIGateway are best-effort
+    and never block the pipeline.
+
+    Sprint 13.7 — Production Stabilization — Data Quality:
+      - The extracted records pass through ``filter_records`` which
+        applies the pre-cache validation gate (valid company name,
+        required fields, extraction score above threshold).
+      - Rejected records are logged but never block the pipeline.
+      - Records with ``below_quality_threshold=True`` are dropped
+        inside ``deterministic_normalize_window`` so they never
+        reach the cache.
     """
+    # Lazy import to avoid a circular dependency at module load.
+    from app.services.discovery_service import MAX_FINAL_COMPANIES
+
     days = lookback_days or settings.WEEKLY_AGENT_LOOKBACK_DAYS
     today = date.today()
     week_ago = today - timedelta(days=days)
     window_start = week_ago.isoformat()
     window_end = today.isoformat()
 
-    tavily_results = _tavily_search_window(window_start, window_end)
+    rss_results = _rss_search_window(window_start, window_end)
 
     deterministic_records = deterministic_normalize_window(
-        tavily_results, window_start, window_end
+        rss_results, window_start, window_end
     )
 
-    # Try Firecrawl + optional LLM enrichment. Both are best-effort.
-    # If Firecrawl fails (rate-limited, network down, key missing),
-    # we keep the deterministic records — the pipeline does NOT
-    # silently degrade to seed. The user explicitly demanded this.
+    # Try Trafilatura + optional AIGateway enrichment. Both are best-effort.
     scraped_markdown: Dict[str, str] = {}
     try:
-        scraped_markdown = _scrape_urls(tavily_results)
+        scraped_markdown = _scrape_articles(rss_results)
     except Exception as exc:
-        logger.warning("Firecrawl scrape failed (%s); using Tavily snippets only", exc)
+        logger.warning("Article extraction failed (%s); using RSS snippets only", exc)
 
     if scraped_markdown:
         records = _enrich_with_llm(deterministic_records, scraped_markdown)
     else:
         records = deterministic_records
 
-    return records[:MAX_FINAL_COMPANIES]
+    # Sprint 13.7: pre-cache validation gate. Reject records whose
+    # required fields are missing, whose names fail validation, or
+    # whose extraction score is below the quality threshold.
+    valid, rejected = _validate_records(records)
+    if rejected:
+        logger.info(
+            "WeeklyFundingAgent: rejected %d/%d records at validation gate",
+            len(rejected),
+            len(records),
+        )
+        for rec in rejected[:5]:  # log first 5 only
+            logger.info(
+                "  rejected %r: %s",
+                rec.get("name"),
+                rec.get("rejection_reasons"),
+            )
+
+    return valid[:MAX_FINAL_COMPANIES]
+
+
+def _validate_records(
+    records: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Sprint 13.7: apply ``filter_records`` (pre-cache validation
+    gate) to the discovery results. Returns ``(valid, rejected)``.
+    """
+    from app.services._deterministic_extractor import filter_records
+    return filter_records(records)
 
 
 def run_weekly_refresh(force: bool = False) -> Dict[str, Any]:

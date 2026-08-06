@@ -50,24 +50,31 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite:///./fundflow.db"
 
-    # Tavily (web search)
-    TAVILY_API_KEY: str = ""
-
-    # Firecrawl (web scraping)
-    FIRECRAWL_API_KEY: str = ""
-
     # Discovery cache TTL in hours
     DISCOVERY_CACHE_HOURS: int = 24
 
-    # LLM provider — declared so the .env value is preserved, but the
-    # orchestrator only routes through OpenRouter today. Kept for
-    # future multi-provider support.
-    LLM_PROVIDER: str = "openrouter"
+    # ── AI Gateway (Sprint 9) ─────────────────────────────────────────
+    # All LLM calls now route through ``app.services.ai_gateway`` with
+    # this fallback order: groq → openrouter → cerebras. The gateway
+    # only needs ONE provider to succeed; missing keys are skipped
+    # silently and the next provider is tried.
+    LLM_PROVIDER_ORDER: str = "groq,openrouter,cerebras"
+    LLM_PROVIDER_ENABLED: str = ""  # empty = all enabled; comma-separated override
 
-    # OpenRouter (LLM gateway)
+    # Groq (primary — fast + free tier)
+    GROQ_API_KEY: str = ""
+    GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
+    GROQ_MODEL: str = "llama-3.1-8b-instant"
+
+    # OpenRouter (fallback)
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
+
+    # Cerebras (final fallback)
+    CEREBRAS_API_KEY: str = ""
+    CEREBRAS_BASE_URL: str = "https://api.cerebras.ai/v1"
+    CEREBRAS_MODEL: str = "llama-3.3-70b"
 
     # Environment
     # ``ENVIRONMENT`` switches between ``development`` and ``production``.
@@ -101,10 +108,10 @@ settings = Settings()
 # Required env vars for every deployment. Validation runs *before* the
 # FastAPI app is constructed so a misconfigured deployment fails fast
 # with a clear, actionable error instead of returning confusing 500s.
+# Sprint 9: only DATABASE_URL is hard-required. The AI gateway accepts
+# any of the three provider keys; if none are set, the gateway returns
+# None on every call (callers fall back to deterministic output).
 _REQUIRED_VARS: List[str] = [
-    "OPENROUTER_API_KEY",
-    "OPENROUTER_BASE_URL",
-    "OPENROUTER_MODEL",
     "DATABASE_URL",
 ]
 

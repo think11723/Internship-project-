@@ -325,48 +325,25 @@ def _normalize_host(url: str) -> str:
 
 
 # ─── HTTP wrappers ─────────────────────────────────────────────────────
-def _tavily_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
-    """Best-effort Tavily lookup. Returns [] on any failure."""
-    if not settings.TAVILY_API_KEY:
-        return []
-    try:
-        with httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
-            r = client.post(
-                "https://api.tavily.com/search",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {settings.TAVILY_API_KEY}",
-                },
-                json={"query": query, "max_results": max_results, "topic": "general"},
-            )
-            r.raise_for_status()
-            return r.json().get("results", [])
-    except Exception:
-        return []
+def _duckduckgo_search(query: str, max_results: int = 3) -> List[Dict[str, Any]]:
+    """Best-effort DuckDuckGo search. Returns [] on any failure.
+
+    Sprint 9 migration: replaced the previous Tavily wrapper with a
+    DuckDuckGo wrapper. No API key required.
+    """
+    from app.services.web_search import search_urls
+    urls = search_urls(query, max_results=max_results)
+    return [{"url": u, "title": "", "content": ""} for u in urls]
 
 
-def _firecrawl_scrape(url: str, timeout: float = 5.0) -> str:
-    """Best-effort Firecrawl lookup. Returns "" on any failure."""
-    if not settings.FIRECRAWL_API_KEY:
-        return ""
-    try:
-        with httpx.Client(timeout=httpx.Timeout(timeout, connect=2.0)) as client:
-            r = client.post(
-                "https://api.firecrawl.dev/v1/scrape",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {settings.FIRECRAWL_API_KEY}",
-                },
-                json={"url": url, "formats": ["markdown"]},
-            )
-            r.raise_for_status()
-            return (
-                r.json().get("data", {}).get("markdown")
-                or r.json().get("markdown")
-                or ""
-            )
-    except Exception:
-        return ""
+def _trafilatura_scrape(url: str, timeout: float = 15.0) -> str:
+    """Best-effort Trafilatura extraction (with newspaper4k fallback).
+
+    Sprint 9 migration: replaced the previous Firecrawl wrapper.
+    Returns "" on any failure.
+    """
+    from app.services.article_extractor import extract_article
+    return extract_article(url)
 
 
 # ─── Extractors (all pure regex / heuristic; no LLM) ─────────────────
@@ -455,7 +432,7 @@ def _verify_url_reachable(url: str, timeout: float = 4.0) -> bool:
 def _candidate_website_score(
     url: str,
     company_name: str,
-    tavily_score: float = 0.0,
+    search_score: float = 0.0,
 ) -> float:
     """Score a candidate company-website URL on a 0..1 scale.
 
@@ -463,7 +440,7 @@ def _candidate_website_score(
       - Domain not in publisher/aggregator blocklist (+0.30)
       - Domain contains company-name slug (+0.25)
       - First word of company name matches first segment of domain (+0.15)
-      - Tavily relevance score (+0.0-0.20)
+      - Search (DuckDuckGo) relevance score (+0.0-0.20)
       - Path is shallow ("/" or "/about" or "/platform" etc.) (+0.05)
       - URL is HTTPS (+0.05)
 
@@ -492,8 +469,8 @@ def _candidate_website_score(
     ):
         score += 0.15
 
-    if tavily_score > 0:
-        score += min(0.20, max(0.0, tavily_score) * 0.20)
+    if search_score > 0:
+        score += min(0.20, max(0.0, search_score) * 0.20)
 
     path = ""
     if "://" in url:
@@ -542,7 +519,7 @@ def _find_company_website(
                     url,
                     {
                         "url": url,
-                        "tavily_score": 0.0,
+                        "search_score": 0.0,
                         "signals": ["canonical_tag"],
                     },
                 )
@@ -559,7 +536,7 @@ def _find_company_website(
                     url,
                     {
                         "url": url,
-                        "tavily_score": 0.0,
+                        "search_score": 0.0,
                         "signals": candidates.get(url, {}).get(
                             "signals", []
                         )
@@ -568,7 +545,7 @@ def _find_company_website(
                 )
 
     # Signal 2: Tavily search.
-    tavily_results = _tavily_search(
+    tavily_results = _duckduckgo_search(
         f"{company_name} official website homepage", max_results=8
     )
     for r in tavily_results:
@@ -582,7 +559,7 @@ def _find_company_website(
         merged_signals = (existing["signals"] if existing else []) + ["tavily_search"]
         candidates[url] = {
             "url": url,
-            "tavily_score": float(r.get("score", 0.0) or 0.0),
+            "search_score": float(r.get("score", 0.0) or 0.0),
             "signals": merged_signals,
         }
 
@@ -597,7 +574,7 @@ def _find_company_website(
         if _normalize_host(url) == article_host:
             continue  # the funding article itself
         conf = _candidate_website_score(
-            url, company_name, tavily_score=entry["tavily_score"]
+            url, company_name, search_score=entry["search_score"]
         )
         if conf <= 0.0:
             continue
@@ -754,7 +731,7 @@ def _find_careers_page(
 
     # Signal 4: Tavily search.
     query = (company_name or company_host) + " careers jobs"
-    tavily_results = _tavily_search(query, max_results=5)
+    tavily_results = _duckduckgo_search(query, max_results=5)
     for r in tavily_results:
         url = r.get("url", "")
         if not url:
@@ -796,7 +773,7 @@ def _find_careers_page(
 
 
 def _find_linkedin(company_name: str) -> Optional[str]:
-    results = _tavily_search(f"{company_name} linkedin company", max_results=3)
+    results = _duckduckgo_search(f"{company_name} linkedin company", max_results=3)
     for r in results:
         url = r.get("url", "")
         m = _LINKEDIN_PATTERN.search(url)
@@ -806,7 +783,7 @@ def _find_linkedin(company_name: str) -> Optional[str]:
 
 
 def _find_github_org(company_name: str) -> Optional[Tuple[str, str]]:
-    results = _tavily_search(f"{company_name} github organization", max_results=3)
+    results = _duckduckgo_search(f"{company_name} github organization", max_results=3)
     for r in results:
         url = r.get("url", "")
         m = _GITHUB_PATTERN.search(url)
@@ -1139,7 +1116,7 @@ def enrich_company(company: Dict[str, Any], timeout_per_call: float = 6.0) -> Di
         funding_content_full = ""
         if source_url:
             futures["funding_content_full"] = pool.submit(
-                _firecrawl_scrape, source_url, timeout_per_call
+                _trafilatura_scrape, source_url, timeout_per_call
             )
         else:
             futures["funding_content_full"] = None
@@ -1215,7 +1192,7 @@ def enrich_company(company: Dict[str, Any], timeout_per_call: float = 6.0) -> Di
 
     careers_content = ""
     if careers_page:
-        careers_content = _safe(_firecrawl_scrape, careers_page, timeout_per_call)
+        careers_content = _safe(_trafilatura_scrape, careers_page, timeout_per_call)
 
     funding_content_full = (results.get("funding_content_full") or "") + "\n" + careers_content
     blob = funding_content_initial + "\n" + funding_content_full

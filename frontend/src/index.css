@@ -72,6 +72,18 @@
   ::-webkit-scrollbar-thumb:hover {
     @apply bg-muted-medium;
   }
+
+  /* Firefox scrollbar */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(168 162 158) transparent;
+  }
+
+  /* Sprint 15 — stable selection colour so text-highlighted copy
+     looks intentional, not browser-default. */
+  ::selection {
+    @apply bg-accent-lime/30 text-dark-primary;
+  }
 }
 
 @layer components {
@@ -160,6 +172,13 @@
     content: '';
     @apply absolute inset-0 bg-gradient-to-r from-transparent via-background-card/50 to-transparent;
     animation: shimmer 1.5s infinite;
+  }
+  /* Sprint 15 — honour reduced-motion preference for skeletons. */
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton::after {
+      animation: none;
+      opacity: 0.6;
+    }
   }
 
   /* Pipeup loader */

@@ -10,11 +10,21 @@ const Layout = () => {
     <ReportProvider>
       <ResumeProvider>
         <div className="min-h-screen bg-background-primary">
+          <a
+            href="#main-content"
+            className="skip-link"
+          >
+            Skip to main content
+          </a>
           <Navbar />
           <div className="flex">
             <Sidebar />
-            <main className="flex-1 ml-64 mt-16">
-              <div className="max-w-7xl mx-auto px-8 py-10">
+            <main
+              id="main-content"
+              className="flex-1 mt-16 md:ml-64"
+              tabIndex={-1}
+            >
+              <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 sm:py-10 lg:px-8">
                 <Outlet />
               </div>
             </main>

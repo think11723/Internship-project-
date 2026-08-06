@@ -150,6 +150,37 @@ def _write_cache(
     elif not isinstance(companies, list):
         companies = list(companies) if companies else []
 
+    # Sprint 13.7 — Production Stabilization — Data Quality.
+    # Pre-cache validation gate. Drop records whose required fields
+    # are missing or whose extraction score is below the quality
+    # threshold. This is defense-in-depth: the weekly funding agent
+    # already runs ``filter_records`` before this point, but the
+    # cache writer is the single chokepoint for every discovery
+    # pathway (weekly agent, first-deployment live discovery,
+    # enrichment refresh). Validating here means garbage cannot
+    # land in the cache no matter who calls it.
+    #
+    # RC-1 — skip the gate for seed records. The curated seed
+    # dataset (20 static companies) has no ``extraction_score``
+    # because it never went through the RSS pipeline, and writing
+    # it as ``[]`` after filtering would corrupt the cache exactly
+    # as it did on this sprint. RSS records still pass through the
+    # gate unchanged.
+    if data_source != "seed":
+        try:
+            from app.services._deterministic_extractor import filter_records
+            before = len(companies)
+            valid, rejected = filter_records(companies)
+            if rejected:
+                logger.info(
+                    "_write_cache: rejected %d/%d records at validation gate",
+                    len(rejected),
+                    before,
+                )
+            companies = valid
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("_write_cache: validation gate skipped: %s", exc)
+
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         existing: Dict[str, Any] = {}
@@ -268,10 +299,18 @@ def get_cache_stats() -> Dict[str, Any]:
 
 
 def _run_discovery() -> List[Dict[str, Any]]:
-    """Run the live discovery pipeline. Raises on any failure."""
-    from app.services.discovery_service import discover_companies_from_web
+    """Run the live RSS discovery pipeline. Raises on any failure.
 
-    companies = discover_companies_from_web()
+    RC-1 — delegate to the Sprint-9 RSS pipeline
+    (``weekly_funding_agent.discover_last_week_funding``) instead
+    of the legacy Tavily discovery module. The legacy module
+    references ``settings.TAVILY_API_KEY`` which no longer exists,
+    raising AttributeError on every call. The RSS pipeline is the
+    only live discovery path we ship today.
+    """
+    from app.services.weekly_funding_agent import discover_last_week_funding
+
+    companies = discover_last_week_funding()
     if not companies:
         raise RuntimeError("Discovery returned no companies")
     return companies
@@ -298,11 +337,23 @@ def _load_companies() -> List[Dict[str, Any]]:
       exists yet to lose).
     """
     cached = _read_cache()
-    if cached is not None:
+    if cached is not None and cached.get("companies"):
         # Existing cache is authoritative. Return its companies verbatim,
         # regardless of data_source. The caller can inspect metadata to
         # decide whether to surface "seed fallback" UI hints.
         return cached["companies"] if isinstance(cached, dict) else cached
+
+    # RC-1 — a cache file that contains an empty ``companies`` list is
+    # corrupt (e.g. written by an older version of the validation
+    # gate that filtered seed records to ``[]``). Treat it as a cache
+    # miss and regenerate. This also keeps the documented contract
+    # "Always returns a non-empty list of companies" intact.
+    if cached is not None and not cached.get("companies"):
+        logger.warning(
+            "Cached discovery is empty; treating as cache miss and "
+            "regenerating (this should be a one-time recovery)"
+        )
+        invalidate_cache()
 
     # No cache exists — this is first deployment (or the cache was
     # manually invalidated). Live discovery is permitted; if it fails,

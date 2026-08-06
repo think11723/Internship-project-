@@ -17,7 +17,7 @@ from app.core.logging import setup_logging
 from app.core.exceptions import setup_exception_handlers
 from app.core.middleware import ValidationMiddleware
 from app.db.session import engine, Base
-from app.api.routes import health, resume, companies, documents, workflow
+from app.api.routes import health, resume, companies, documents, workflow, career
 
 # Fail fast if required environment variables are missing. This runs
 # *before* the FastAPI app is constructed so the failure is loud and
@@ -57,6 +57,7 @@ app.include_router(resume.router, prefix="/api/resume", tags=["Resume"])
 app.include_router(companies.router, prefix="/api/companies", tags=["Companies"])
 app.include_router(documents.router, prefix="/api/documents", tags=["Documents"])
 app.include_router(workflow.router, prefix="/api/workflow", tags=["Workflow"])
+app.include_router(career.router, prefix="/api", tags=["Career"])
 
 
 def _prewarm_discovery_cache() -> None:
