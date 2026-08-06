@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # CORS configuration — populated from .env in production.
     ALLOWED_ORIGINS: List[str] = [
+        "https://fundflowai.vercel.app/",
         "http://localhost:3000",
         "http://localhost:3001",
         "http://localhost:3002",
