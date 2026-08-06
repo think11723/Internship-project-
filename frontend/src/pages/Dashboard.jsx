@@ -522,7 +522,7 @@ const Dashboard = () => {
     }
     let cancelled = false
     Promise.all([
-      getCompanies({ limit: 200 }),
+      getCompanies({ limit: 100 }),
       getCareerPlan(),
     ])
       .then(([listRes, careerPlan]) => {

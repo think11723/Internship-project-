@@ -239,7 +239,7 @@ const CareerImprovementRoadmap = () => {
   useEffect(() => {
     let cancelled = false
     Promise.all([
-      getCompanies({ limit: 200 }).catch(() => ({ data: { companies: [] } })),
+      getCompanies({ limit: 100 }).catch(() => ({ data: { companies: [] } })),
       getCareerPlan().catch(() => null),
     ])
       .then(([listRes, careerPlan]) => {

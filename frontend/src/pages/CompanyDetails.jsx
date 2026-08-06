@@ -1204,7 +1204,7 @@ const CompanyDetails = () => {
     // portfolio.
     Promise.all([
       getCompany(companyName),
-      getCompaniesIntelligence({ limit: 200 }),
+      getCompaniesIntelligence({ limit: 100 }),
       getCareerPlan().catch(() => null),
     ])
       .then(([detailRes, companies, careerPlan]) => {
