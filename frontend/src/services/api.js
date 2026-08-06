@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { decodeDeep } from '../utils/htmlEntities'
 
 // Use empty string to leverage Vite proxy for /api requests
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || ''
@@ -16,19 +17,84 @@ const api = axios.create({
   timeout: REQUEST_TIMEOUT_MS,
 })
 
-// Request interceptor — pass-through. Hook left in place so future
-// auth headers / request IDs can be added here.
+// Key under which this browser's opaque user id is persisted.
+const USER_ID_STORAGE_KEY = 'fundflow:uid'
+
+/**
+ * Return this browser's user id, minting one on first use.
+ *
+ * INTERIM — this is an isolation key, not a credential. It is generated
+ * client-side and the backend does not verify it, so it separates users'
+ * data but proves nothing about who is calling.
+ *
+ * TODO(firebase): replace the body of this function with
+ * `await getAuth().currentUser?.getIdToken()` and switch the header
+ * below to `Authorization: Bearer <token>`. The backend already prefers
+ * that header (see backend/app/core/auth.py), so no other frontend file
+ * needs to change.
+ *
+ * Falls back to an in-memory id when localStorage is unavailable
+ * (private browsing, storage disabled) so requests still succeed —
+ * isolation then lasts only for the page session.
+ */
+let inMemoryUserId = null
+
+function getUserId() {
+  try {
+    const existing = localStorage.getItem(USER_ID_STORAGE_KEY)
+    if (existing) return existing
+    const minted = generateUserId()
+    localStorage.setItem(USER_ID_STORAGE_KEY, minted)
+    return minted
+  } catch {
+    // Storage unavailable — keep one id for the lifetime of the page.
+    if (!inMemoryUserId) inMemoryUserId = generateUserId()
+    return inMemoryUserId
+  }
+}
+
+/**
+ * Generate an id matching the backend's accepted charset:
+ * ^[A-Za-z0-9_-]{1,128}$ (see backend/app/core/auth.py). Note this
+ * excludes dots and slashes because the id is used as a directory name
+ * server-side.
+ */
+function generateUserId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID().replace(/-/g, '')
+  }
+  // Fallback for older browsers / non-secure contexts.
+  return `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`
+}
+
+// Request interceptor — attach the caller's identity to every request.
+// This is the single place identity enters the API layer; no call-site
+// needs to know about it.
 api.interceptors.request.use(
-  (config) => config,
+  (config) => {
+    config.headers = config.headers || {}
+    config.headers['X-User-Id'] = getUserId()
+    return config
+  },
   (error) => Promise.reject(error)
 )
 
-// Response interceptor — normalize every error into a single,
-// user-readable message. The backend already returns
+// Response interceptor — decode HTML entities, then normalize every error
+// into a single, user-readable message. The backend already returns
 // { status, message, error_code, request_id } but we keep the
 // normalization here so the UI never has to read axios internals.
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // Company copy is scraped from press releases and careers pages, so it
+    // arrives HTML-encoded (`Anthropic&rsquo;s`, `Series&nbsp;B`). React
+    // renders text nodes literally and never decodes entities, so we decode
+    // here — the single point where backend data enters the app. Every
+    // service imports this instance, so no component or service should
+    // decode again (a second pass would over-decode intentionally
+    // double-encoded text). See utils/htmlEntities.js.
+    response.data = decodeDeep(response.data)
+    return response
+  },
   (error) => {
     const userMessage = toUserMessage(error)
     // Surface the original axios error for the console; the UI uses
@@ -78,5 +144,5 @@ function toUserMessage(error) {
 }
 
 export default api
-export { toUserMessage, REQUEST_TIMEOUT_MS }
+export { toUserMessage, REQUEST_TIMEOUT_MS, getUserId, USER_ID_STORAGE_KEY }
 

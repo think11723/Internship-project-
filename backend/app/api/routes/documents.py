@@ -7,10 +7,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import Dict, Optional
 
+from app.core.auth import get_current_user_id
 from app.db.session import get_db
-from app.models.resume import Resume
 from app.services.generation_service import generate_cover_letter
 from app.services.orchestrator import _build_candidate, _load_companies
+from app.services.user_scope import get_user_resume
 
 router = APIRouter()
 
@@ -57,12 +58,15 @@ class CoverLetterResponse(BaseModel):
 async def generate_document(
     payload: GenerateDocumentRequest,
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
 ):
     """Generate a personalized cover letter for a specific company.
 
-    Reuses the existing ``generate_cover_letter`` service. Fails
-    gracefully if no resume has been uploaded, the company is not in
-    the Demo Data set, or the LLM call errors.
+    Reuses the existing ``generate_cover_letter`` service. The letter is
+    written from the authenticated user's own resume and returned only
+    to them — it is never persisted, so it cannot be read by anyone
+    else. Fails gracefully if this user has not uploaded a resume, the
+    company is not in the Demo Data set, or the LLM call errors.
     """
     company = _find_company(payload.company_name)
     if company is None:
@@ -71,9 +75,7 @@ async def generate_document(
             detail=f"Company '{payload.company_name}' not found",
         )
 
-    latest_resume = (
-        db.query(Resume).order_by(Resume.parsed_at.desc()).first()
-    )
+    latest_resume = get_user_resume(db, user_id)
     if latest_resume is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

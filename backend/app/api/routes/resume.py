@@ -3,12 +3,12 @@
 import os
 import uuid
 import time
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from app.core.auth import get_current_user_id
 from app.core.logging import logger, log_performance
 from app.core.middleware import sanitize_filename, validate_mime_type
 from app.db.session import get_db
@@ -21,35 +21,45 @@ from app.schemas.resume import (
     ResumeUploadResponse,
 )
 from app.services.resume_service import ResumeIntelligenceService
+from app.services.user_scope import (
+    UPLOAD_ROOT,
+    count_user_resumes,
+    delete_user_resumes,
+    get_user_resume,
+    purge_user_upload_dir,
+    user_upload_dir,
+)
 
 router = APIRouter()
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_MIME_TYPES = {"application/pdf"}
 
-# Uploads directory: configurable via ``FUNDFLOW_DATA_DIR`` env var
-# so deployments can mount a persistent volume (e.g. ``/data``).
-# In dev / local Docker the variable is unset and uploads land in
-# ``./uploads`` next to the database file.
-UPLOAD_DIR = Path(os.environ.get("FUNDFLOW_DATA_DIR", ".")) / "uploads"
+# Uploads root. Per-user subdirectories are created on demand by
+# ``user_upload_dir``; see app/services/user_scope.py.
+UPLOAD_DIR = UPLOAD_ROOT
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # In-memory job registry for upload progress.
-# Keyed by job_id (UUID string). Each entry is a dict with the
-# current stage, last update timestamp, terminal status, and
-# the final result payload (when status == "done").
+#
+# Keyed by ``(user_id, job_id)`` — NOT by job_id alone. The job_id is
+# client-supplied, and each entry holds the full resume analysis in its
+# ``result`` payload, so a bare job_id key let any caller who learned or
+# guessed an id read someone else's parsed resume. The user_id in the
+# key means a lookup can only ever return the caller's own job.
+#
 # Entries are pruned after JOB_TTL_SECONDS to keep the dict bounded.
 JOB_TTL_SECONDS = 300
-_JOB_STATE: Dict[str, Dict[str, Any]] = {}
+_JOB_STATE: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 
-def _job_update(job_id: Optional[str], stage: str, status: str = "running",
+def _job_update(user_id: str, job_id: Optional[str], stage: str, status: str = "running",
                 error: Optional[str] = None, result: Optional[Dict[str, Any]] = None) -> None:
     """Update (or create) a job state entry. Safe to call with job_id=None."""
     if not job_id:
         return
-    _JOB_STATE[job_id] = {
+    _JOB_STATE[(user_id, job_id)] = {
         "stage": stage,
         "status": status,
         "updated_at": time.time(),
@@ -61,10 +71,20 @@ def _job_update(job_id: Optional[str], stage: str, status: str = "running",
 def _job_prune() -> None:
     """Remove job entries older than JOB_TTL_SECONDS that have finished."""
     cutoff = time.time() - JOB_TTL_SECONDS
-    stale = [jid for jid, entry in _JOB_STATE.items()
+    stale = [key for key, entry in _JOB_STATE.items()
              if entry.get("status") in {"done", "failed"} and entry.get("updated_at", 0) < cutoff]
-    for jid in stale:
-        _JOB_STATE.pop(jid, None)
+    for key in stale:
+        _JOB_STATE.pop(key, None)
+
+
+def _job_clear_user(user_id: str) -> None:
+    """Drop every job entry belonging to ``user_id``.
+
+    Replaces the previous ``_JOB_STATE.clear()``, which wiped every
+    user's in-flight uploads whenever anyone deleted a resume.
+    """
+    for key in [k for k in _JOB_STATE if k[0] == user_id]:
+        _JOB_STATE.pop(key, None)
 
 
 def _serialize_analysis(resume: Resume) -> Dict[str, Any]:
@@ -110,12 +130,17 @@ def _serialize_analysis(resume: Resume) -> Dict[str, Any]:
 async def upload_resume(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
     x_upload_id: Optional[str] = Header(None, alias="X-Upload-Id"),
 ):
     """Upload a PDF resume, extract its text, analyze it, and save the structured profile.
 
     Validates file type, size, and content before processing. Uses AI for structured
     extraction with local fallback if AI is unavailable.
+
+    The resume is stored against the authenticated user. Uploading
+    replaces only that user's previous resume; other users are never
+    touched.
 
     If the client sends an ``X-Upload-Id`` header, the route writes per-stage
     progress to the in-memory job registry so the frontend can poll
@@ -150,21 +175,27 @@ async def upload_resume(
             )
 
         file_id = str(uuid.uuid4())
-        temp_file_path = UPLOAD_DIR / f"{file_id}.pdf"
+        # Per-user upload directory — one user's PDF can never land on
+        # or overwrite another's. The file is still deleted once parsing
+        # completes; the directory is the isolation boundary, not a
+        # retention mechanism.
+        temp_file_path = user_upload_dir(user_id) / f"{file_id}.pdf"
         temp_file_path.write_bytes(content)
 
         # Single-active-resume policy (Sprint 4 B1): uploading a new
         # resume REPLACES any existing row. The "Replace" button on
         # the frontend used to APPEND, leaking rows and confusing the
-        # "latest" lookup. Clear all rows before insert.
+        # "latest" lookup.
+        #
+        # Scoped to this user. This delete previously had no WHERE
+        # clause, so any upload destroyed every other user's resume.
         try:
-            db.query(Resume).delete()
-            db.commit()
+            delete_user_resumes(db, user_id)
         except Exception as exc:
             logger.warning("Resume replace: pre-insert delete failed: %s", exc)
             db.rollback()
 
-        _job_update(job_id, "Reading PDF", "running")
+        _job_update(user_id, job_id, "Reading PDF", "running")
 
         # Process resume with timing + per-stage progress writes
         service = ResumeIntelligenceService()
@@ -172,7 +203,7 @@ async def upload_resume(
             process_start = time.time()
 
             def _progress(stage: str) -> None:
-                _job_update(job_id, stage, "running")
+                _job_update(user_id, job_id, stage, "running")
 
             profile, extracted_text = service.process_resume(
                 str(temp_file_path),
@@ -181,19 +212,20 @@ async def upload_resume(
             process_duration = (time.time() - process_start) * 1000
             log_performance("resume_processing", process_duration, {"file_id": file_id})
         except ValueError as exc:
-            _job_update(job_id, "Failed", "failed", error=str(exc))
+            _job_update(user_id, job_id, "Failed", "failed", error=str(exc))
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             logger.error("Resume intelligence failed: %s", exc)
-            _job_update(job_id, "Failed", "failed", error=str(exc))
+            _job_update(user_id, job_id, "Failed", "failed", error=str(exc))
             raise HTTPException(
                 status_code=500,
                 detail="Failed to analyze resume with AI. Please try again."
             ) from exc
 
-        _job_update(job_id, "Finalizing Analysis", "running")
+        _job_update(user_id, job_id, "Finalizing Analysis", "running")
 
         resume = Resume(
+            user_id=user_id,
             original_filename=safe_filename,
             name=profile.name,
             email=profile.email,
@@ -215,7 +247,10 @@ async def upload_resume(
         db.commit()
         db.refresh(resume)
 
-        logger.info("Resume stored in database with ID: %s", resume.id)
+        logger.info(
+            "Resume stored in database with ID: %s (user_id=%s)",
+            resume.id, user_id,
+        )
 
         if temp_file_path and temp_file_path.exists():
             os.remove(temp_file_path)
@@ -231,7 +266,7 @@ async def upload_resume(
             "extracted_text": extracted_text,
             "summary": summary,
         }
-        _job_update(job_id, "Completed", "done", result=response_payload)
+        _job_update(user_id, job_id, "Completed", "done", result=response_payload)
         return ResumeUploadResponse(
             success=True,
             profile=profile,
@@ -243,7 +278,7 @@ async def upload_resume(
         raise
     except Exception as exc:
         logger.error("Unexpected error during resume upload: %s", exc)
-        _job_update(job_id, "Failed", "failed", error=str(exc))
+        _job_update(user_id, job_id, "Failed", "failed", error=str(exc))
         if temp_file_path and temp_file_path.exists():
             try:
                 os.remove(temp_file_path)
@@ -258,13 +293,17 @@ async def upload_resume(
 # ---------- Resume Management endpoints ----------
 
 @router.get("/latest", response_model=ResumeMetadataResponse)
-async def get_latest_resume(db: Session = Depends(get_db)):
-    """Return lightweight metadata for the most-recently parsed resume.
+async def get_latest_resume(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return lightweight metadata for the authenticated user's resume.
 
     Used by the "Current Resume" card on the upload page. Returns 404 when
-    no resume has been uploaded yet.
+    *this user* has not uploaded a resume — another user's upload does not
+    satisfy the lookup.
     """
-    resume = db.query(Resume).order_by(Resume.parsed_at.desc()).first()
+    resume = get_user_resume(db, user_id)
     if resume is None:
         raise HTTPException(status_code=404, detail="No resume uploaded yet")
 
@@ -286,59 +325,70 @@ async def get_latest_resume(db: Session = Depends(get_db)):
 
 
 @router.get("/latest/analysis")
-async def get_latest_resume_analysis(db: Session = Depends(get_db)):
-    """Return the full ``ResumeUploadResponse``-shaped payload for the latest resume.
+async def get_latest_resume_analysis(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return the full ``ResumeUploadResponse``-shaped payload for this user's resume.
 
     Used by the "View Resume" action on the upload page. Returns 404 when
-    no resume exists.
+    this user has no resume.
     """
-    resume = db.query(Resume).order_by(Resume.parsed_at.desc()).first()
+    resume = get_user_resume(db, user_id)
     if resume is None:
         raise HTTPException(status_code=404, detail="No resume uploaded yet")
     return _serialize_analysis(resume)
 
 
 @router.delete("/latest")
-async def delete_latest_resume(db: Session = Depends(get_db)):
-    """Delete ALL parsed resumes and invalidate related caches.
+async def delete_latest_resume(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Delete the authenticated user's resume and all of their derived state.
 
-    The application enforces a single-active-resume policy, so the
-    user-facing "Delete Resume" action must fully clear state and
-    return the dashboard to first-use. Returns 404 when no resume
-    exists. Always invalidates the in-memory job-state registry and
-    the discovery cache.
+    The application enforces a single-active-resume policy per user, so
+    the user-facing "Delete Resume" action must fully clear that user's
+    state and return their dashboard to first-use. Returns 404 when this
+    user has no resume.
+
+    Everything cleared here is user-scoped. The company discovery cache
+    is GLOBAL and deliberately left alone — it is shared by every user
+    and contains no resume-derived data, so dropping it on one user's
+    delete would have discarded another user's working set and forced a
+    full re-discovery. (The previous implementation did exactly that.)
     """
-    count = db.query(Resume).count()
+    count = count_user_resumes(db, user_id)
     if count == 0:
         raise HTTPException(status_code=404, detail="No resume to delete")
 
     _job_prune()
-    _JOB_STATE.clear()
+    _job_clear_user(user_id)
 
-    db.query(Resume).delete()
-    db.commit()
+    delete_user_resumes(db, user_id)
 
-    # Invalidate the company discovery cache so the next orchestration
-    # run reflects the absence of the resume.
-    try:
-        from app.services.orchestrator import invalidate_cache
-        invalidate_cache()
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Failed to invalidate discovery cache: %s", exc)
+    # Reclaim any PDF whose post-parse cleanup failed. No-op normally.
+    purge_user_upload_dir(user_id)
 
     return {"success": True, "deleted_count": count}
 
 
 @router.get("/upload-status/{job_id}")
-async def get_upload_status(job_id: str):
+async def get_upload_status(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
     """Return the current stage of an in-flight upload job.
 
     The job is created when the client posts a file to
     ``/api/resume/upload`` with the same id in the ``X-Upload-Id`` header.
-    Returns 404 when the job is unknown (expired or never existed).
+    Returns 404 when the job is unknown (expired, never existed, or
+    belongs to a different user — the three are indistinguishable to the
+    caller by design, so this cannot be used to probe for other users'
+    job ids).
     """
     _job_prune()
-    entry = _JOB_STATE.get(job_id)
+    entry = _JOB_STATE.get((user_id, job_id))
     if entry is None:
         raise HTTPException(status_code=404, detail="Unknown or expired job")
     return {

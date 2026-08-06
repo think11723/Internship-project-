@@ -31,8 +31,11 @@ import {
 import { getCareerPlan } from '../services/careerService'
 import { generateCoverLetter } from '../services/generationService'
 
+// Bands track the backend match score (orchestrator._score_company), which
+// spans the full 0-100 range. Previously 92/82/70, calibrated to an older
+// formula that could not emit a score below 70.
 const RECOMMENDED_ACTION = (score) => {
-  if (score >= 92) {
+  if (score >= 80) {
     return {
       label: 'Apply This Week',
       detail:
@@ -40,7 +43,7 @@ const RECOMMENDED_ACTION = (score) => {
       tone: 'high',
     }
   }
-  if (score >= 82) {
+  if (score >= 65) {
     return {
       label: 'Monitor Hiring',
       detail:
@@ -48,7 +51,7 @@ const RECOMMENDED_ACTION = (score) => {
       tone: 'medium',
     }
   }
-  if (score >= 70) {
+  if (score >= 45) {
     return {
       label: 'Connect with Engineering Team',
       detail:
@@ -1352,11 +1355,11 @@ const CompanyDetails = () => {
                 <span className="text-2xl font-semibold text-gray-500">/100</span>
               </p>
               <p className="mt-2 text-[11px] font-bold uppercase tracking-widest text-primary-700">
-                {match.score >= 92
+                {match.score >= 80
                   ? 'Exceptional alignment'
-                  : match.score >= 82
+                  : match.score >= 65
                   ? 'Strong alignment'
-                  : match.score >= 70
+                  : match.score >= 45
                   ? 'Moderate alignment'
                   : 'Limited alignment'}
               </p>

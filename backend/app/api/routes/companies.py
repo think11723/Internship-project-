@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.resume import Resume
+from app.core.auth import get_current_user_id
+from app.services.user_scope import get_user_resume
 from app.services.orchestrator import (
     _build_candidate,
     _build_reason,
@@ -148,18 +149,24 @@ async def enrich_companies(force: bool = Query(False)):
 
 
 @router.post("/match", response_model=MatchResponse)
-async def match_companies(payload: MatchRequest, db: Session = Depends(get_db)):
+async def match_companies(
+    payload: MatchRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Match companies with candidate profile.
 
     Calculates matching scores using enhanced weighted scoring algorithm
     considering skills, experience, education, and projects. Returns ranked
     companies with detailed match information.
+
+    The company set is global; only the candidate profile is user-scoped.
     """
     from app.services.matching_engine import EnhancedMatchingEngine
-    
+
     companies = _load_companies()
-    
+
     # Build candidate profile from request
     candidate_profile = {
         "skills": payload.skills,
@@ -168,9 +175,9 @@ async def match_companies(payload: MatchRequest, db: Session = Depends(get_db)):
         "secondary_skills": payload.secondary_skills or [],
         "years_of_experience": f"{payload.experience_years}+ years" if payload.experience_years else "",
     }
-    
-    # Add experience and education from latest resume if available
-    latest_resume = db.query(Resume).order_by(Resume.parsed_at.desc()).first()
+
+    # Add experience and education from this user's resume if available
+    latest_resume = get_user_resume(db, user_id)
     if latest_resume:
         candidate_profile["experience"] = latest_resume.experience or []
         candidate_profile["education"] = latest_resume.education or []
@@ -418,23 +425,28 @@ def _build_matching_summary(
     missing_skills: list,
     score: int,
 ) -> str:
-    """One-paragraph summary of overall fit, tuned to the score band."""
+    """One-paragraph summary of overall fit, tuned to the score band.
+
+    Bands track ``orchestrator._score_company``, which spans the full 0-100
+    range. They were previously 92/82/70, calibrated to the old formula that
+    could not emit a score below 70.
+    """
     name = company.get("name", "This company")
     overlap_preview = ", ".join(overlap[:3]) if overlap else "no overlapping skills"
 
-    if score >= 92:
+    if score >= 80:
         return (
             f"{name} is an excellent match for your background. "
             f"You bring {len(overlap)} of their core technologies "
             f"({overlap_preview}), positioning you as a strong candidate."
         )
-    if score >= 82:
+    if score >= 65:
         return (
             f"{name} is a strong fit. "
             f"You bring {len(overlap)} directly relevant skills "
             f"({overlap_preview}) that align with their engineering priorities."
         )
-    if score >= 70:
+    if score >= 45:
         return (
             f"{name} is a moderate fit. "
             f"Your {len(overlap)} overlapping skill(s) provide a foundation, "
@@ -487,6 +499,7 @@ def _build_career_alignment(company: dict, candidate: dict) -> str:
 @router.get("")
 async def list_companies(
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
     industry: Optional[str] = Query(None, description="Filter by industry"),
     location: Optional[str] = Query(None, description="Filter by location"),
     funding_stage: Optional[str] = Query(None, description="Filter by funding stage"),
@@ -499,14 +512,19 @@ async def list_companies(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
 ):
-    """Return companies with filtering, sorting, and pagination against the latest resume.
+    """Return companies with filtering, sorting, and pagination against this user's resume.
 
     Supports filtering by industry, location, funding stage, hiring status,
     minimum score, technology, and text search. Supports sorting by match score,
     funding amount, company size, alphabetical, and newest. Supports pagination
     with page-based navigation.
+
+    The company records themselves are GLOBAL and identical for every
+    user. Only the personalized decorations — ``match_score``,
+    ``matching_skills``, ``why_match``, ``recommendation`` — depend on
+    the caller's resume.
     """
-    # Load companies once
+    # Load companies once (global, shared by every user)
     companies = _load_companies()
     
     # Pre-compute company metadata for performance
@@ -519,9 +537,7 @@ async def list_companies(
             "size_sort": _parse_company_size_sort(_infer_company_size(company)),
         }
     
-    latest_resume = (
-        db.query(Resume).order_by(Resume.parsed_at.desc()).first()
-    )
+    latest_resume = get_user_resume(db, user_id)
 
     has_resume = latest_resume is not None
     candidate = _build_candidate(latest_resume) if has_resume else None
@@ -666,13 +682,21 @@ async def list_companies(
 
 
 @router.get("/{company_name}")
-async def get_company(company_name: str, db: Session = Depends(get_db)):
-    """Return company profile + deterministic match against the latest resume.
+async def get_company(
+    company_name: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return company profile + deterministic match against this user's resume.
 
     Reuses the seed dataset and orchestrator scoring helpers — no OpenAI
-    call. If no resume has been uploaded, the match section degrades to
-    score=0 with a helpful message. Ticket-013 adds five deterministic
-    explanation fields at the top level for the explainable AI report.
+    call. If this user has not uploaded a resume, the match section
+    degrades to score=0 with a helpful message. Ticket-013 adds five
+    deterministic explanation fields at the top level for the explainable
+    AI report.
+
+    The ``company`` block is GLOBAL; every personalized field is derived
+    from the caller's own resume.
     """
     company = _find_company(company_name)
     if company is None:
@@ -681,9 +705,7 @@ async def get_company(company_name: str, db: Session = Depends(get_db)):
             detail=f"Company '{company_name}' not found",
         )
 
-    latest_resume = (
-        db.query(Resume).order_by(Resume.parsed_at.desc()).first()
-    )
+    latest_resume = get_user_resume(db, user_id)
 
     if latest_resume is None:
         company_skills = company.get("skills", [])

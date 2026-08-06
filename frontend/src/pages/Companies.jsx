@@ -352,9 +352,12 @@ const CompanyCard = ({ company, hasResume }) => {
         )}
 
       <p className="mt-3 flex-1 text-sm italic leading-5 text-gray-700 line-clamp-3">
+        {/* Curly quotes as literal characters, not HTML entities: this is a
+            JS template literal, and JSX only decodes entities in JSX *text*
+            position — inside `${...}` they would render as raw `&ldquo;`. */}
         {company.short_description
-          ? `&ldquo;${company.short_description}&rdquo;`
-          : '&mdash;'}
+          ? `“${company.short_description}”`
+          : '—'}
       </p>
 
       {!hasResume && (

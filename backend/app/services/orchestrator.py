@@ -9,6 +9,7 @@ Demo Data fallback when discovery is unavailable.
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -204,11 +205,15 @@ def _write_cache(
                 "fallback": data_source == "seed",
             },
         }
-        # Preserve Career Intelligence metadata if present.
-        for key in ("recommendations_resume_id",
-                     "recommendations_generated_at"):
-            if key in existing and key not in envelope:
-                envelope[key] = existing[key]
+        # NOTE: this envelope is GLOBAL — one file shared by every user.
+        # Nothing resume-derived may be written into it. Two legacy keys
+        # (``recommendations_resume_id``, ``recommendations_generated_at``)
+        # used to be copied forward from any prior envelope here. No code
+        # writes them, no live cache contains them, and carrying a resume
+        # id in a shared file is exactly the class of bug this migration
+        # exists to remove — so the copy-forward is gone. Per-company
+        # recommendations are computed per-request in the companies route
+        # and attached to a request-local copy.
         with open(_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(envelope, f, indent=2)
         # Now that the file exists, populate cached_at_human from its
@@ -504,16 +509,287 @@ def _build_reason(overlap: List[str], company: Dict[str, Any]) -> str:
 
 
 def _score_company(company: Dict[str, Any], candidate_skills: List[str]) -> Dict[str, Any]:
-    """Score one company against the candidate's skills.
+    """Score one company against the candidate on a true 0-100 scale.
 
-    Score formula: 70 + (overlap_count * 6), capped at 98.
-    Lower bound is 70 (matches the ticket's required range).
+    Replaces the previous ``min(98, 70 + overlap_count * 6)`` formula, which
+    collapsed every company onto a narrow band:
+
+    * it was floored at 70, so nothing could ever score below it;
+    * it could only ever emit six values (70/76/82/88/94/98);
+    * it counted raw overlap only, so matching 3 of 3 required skills scored
+      the same as matching 3 of 20; and
+    * discovered companies carry 1-2 generic skill tags (usually just "AI"),
+      so the overlap was nearly always 0 and virtually every company landed
+      on exactly 70.
+
+    Scoring is a weighted blend of signals already present on the company
+    record. Every input is read from data, so the function stays pure and
+    deterministic: the same resume and company always yield the same score,
+    and ranking is stable across calls.
+
+        skill fit           0-50   how much of their stack the candidate has
+        hiring activity     0-18   are they actually recruiting
+        funding stage       0-14   stage-typical hiring appetite
+        funding momentum    0-8    size of the round = budget to hire
+        work mode           0-5    remote removes a relocation barrier
+        seniority alignment 0-5    candidate experience vs the level they want
+
+    Unknown signals score a neutral middle value rather than zero, so a
+    sparsely-enriched record settles mid-table instead of being pushed to the
+    bottom by missing data alone.
+
+    The returned shape is unchanged — ``{"company", "score", "overlap"}`` —
+    and ``overlap`` still contains only the company's own lowercased skill
+    tokens, which callers rely on to map back to original casing.
     """
-    company_skills = {s.lower() for s in company.get("skills", [])}
-    candidate_set = {s.lower() for s in candidate_skills}
-    overlap = sorted(company_skills & candidate_set)
-    score = min(98, 70 + len(overlap) * 6)
-    return {"company": company, "score": score, "overlap": overlap}
+    company_skills = [s.lower() for s in company.get("skills", []) if s]
+    overlap = _matched_company_skills(company_skills, candidate_skills)
+
+    score = (
+        _skill_fit_points(company_skills, overlap)
+        + _hiring_points(company)
+        + _funding_stage_points(company)
+        + _funding_momentum_points(company)
+        + _work_mode_points(company)
+        + _seniority_points(company, candidate_skills)
+    )
+
+    return {
+        "company": company,
+        "score": max(0, min(100, int(round(score)))),
+        "overlap": overlap,
+    }
+
+
+# ─── Match-scoring signals ──────────────────────────────────────────────
+#
+# All helpers below are pure functions of their inputs — no clocks, no
+# randomness, no I/O — so scores are reproducible for a given resume.
+
+# Maps a raw skill token to the broader concepts it demonstrates, applied to
+# BOTH the company and the candidate before comparing. Discovery tags
+# companies with umbrella terms like "AI", which a literal set intersection
+# would never match against a resume listing "PyTorch" or "NLP" — that
+# mismatch is a large part of why overlap was so often empty.
+_SKILL_CONCEPTS = {
+    "ai": {"ai"},
+    "artificial intelligence": {"ai"},
+    "machine learning": {"ai", "ml"},
+    "ml": {"ai", "ml"},
+    "deep learning": {"ai", "ml", "deep learning"},
+    "neural networks": {"ai", "ml", "deep learning"},
+    "pytorch": {"ai", "ml", "deep learning", "pytorch"},
+    "tensorflow": {"ai", "ml", "deep learning", "tensorflow"},
+    "keras": {"ai", "ml", "deep learning"},
+    "jax": {"ai", "ml", "deep learning"},
+    "scikit-learn": {"ai", "ml"},
+    "pandas": {"ai", "ml", "data"},
+    "numpy": {"ai", "ml", "data"},
+    "nlp": {"ai", "nlp"},
+    "natural language processing": {"ai", "nlp"},
+    "llm": {"ai", "nlp", "llm"},
+    "llms": {"ai", "nlp", "llm"},
+    "large language models": {"ai", "nlp", "llm"},
+    "generative ai": {"ai", "llm"},
+    "transformers": {"ai", "nlp", "llm"},
+    "rag": {"ai", "nlp", "llm"},
+    "computer vision": {"ai", "cv"},
+    "cv": {"ai", "cv"},
+    "image processing": {"ai", "cv"},
+    "opencv": {"ai", "cv"},
+    "mlops": {"ai", "ml", "mlops", "infrastructure"},
+    "data science": {"ai", "ml", "data"},
+    "data engineering": {"data", "infrastructure"},
+    "recommendation systems": {"ai", "ml"},
+    "edge computing": {"infrastructure", "distributed systems"},
+    "distributed systems": {"infrastructure", "distributed systems"},
+    "microservices": {"infrastructure", "distributed systems"},
+    "kubernetes": {"infrastructure", "devops"},
+    "docker": {"infrastructure", "devops"},
+    "terraform": {"infrastructure", "devops"},
+    "aws": {"infrastructure", "cloud"},
+    "gcp": {"infrastructure", "cloud"},
+    "azure": {"infrastructure", "cloud"},
+}
+
+
+def _concepts_for(skill: str) -> set:
+    """Expand one skill token into the concepts it demonstrates.
+
+    Unknown tokens map to themselves, so exact matching still works for
+    anything outside the table above.
+    """
+    key = (skill or "").strip().lower()
+    if not key:
+        return set()
+    return _SKILL_CONCEPTS.get(key, {key})
+
+
+def _matched_company_skills(
+    company_skills: List[str], candidate_skills: List[str]
+) -> List[str]:
+    """Return the company skills the candidate can satisfy.
+
+    Entries are always the COMPANY's own lowercased tokens, never the
+    candidate's or an expanded concept name. Callers map these back through
+    ``{s.lower(): s for s in company["skills"]}`` to recover original casing,
+    which would raise ``KeyError`` on any other value.
+    """
+    candidate_concepts = set()
+    for skill in candidate_skills or []:
+        candidate_concepts |= _concepts_for(skill)
+
+    if not candidate_concepts:
+        return []
+
+    return sorted(
+        {
+            skill
+            for skill in company_skills
+            if _concepts_for(skill) & candidate_concepts
+        }
+    )
+
+
+# A candidate matching this many of a company's skills is treated as having
+# full depth. Prevents companies that list many skills from being unreachable
+# and companies that list one from being trivially maxed.
+_SKILL_DEPTH_TARGET = 4
+
+
+def _skill_fit_points(company_skills: List[str], overlap: List[str]) -> float:
+    """Skill component, 0-50.
+
+    Blends coverage (share of their stack the candidate has) with depth
+    (absolute number of matching skills) so that 3-of-3 outranks 3-of-20 while
+    a broad match still counts for something.
+    """
+    unique_skills = set(company_skills)
+    if not unique_skills:
+        # Nothing listed to judge against — neutral rather than zero, so an
+        # unenriched record is not punished for missing data.
+        return 20.0
+
+    matched = len(overlap)
+    coverage = matched / len(unique_skills)
+    depth = matched / min(_SKILL_DEPTH_TARGET, len(unique_skills))
+    return 50.0 * (0.6 * coverage + 0.4 * min(1.0, depth))
+
+
+def _hiring_points(company: Dict[str, Any]) -> float:
+    """Hiring component, 0-18.
+
+    Prefers the enriched ``hiring_status_detailed`` field and falls back to
+    the funding round, which is the same heuristic the companies route uses
+    to display a hiring badge — so score and badge agree.
+    """
+    status = (company.get("hiring_status_detailed") or "").strip().lower()
+    if status == "actively_hiring":
+        return 18.0
+    if status == "hiring":
+        return 13.0
+    if status == "not_hiring":
+        return 2.0
+
+    stage = (company.get("funding_round") or "").lower()
+    if any(s in stage for s in ("series b", "series c", "series d", "series e", "series f")):
+        return 14.0
+    if "series a" in stage:
+        return 11.0
+    return 8.0  # unknown — neutral
+
+
+def _funding_stage_points(company: Dict[str, Any]) -> float:
+    """Funding-stage component, 0-14.
+
+    Early-growth companies hire hardest; pre-seed is riskier and late stage
+    is slower-moving, so both sit below the Series A/B peak.
+    """
+    stage = (company.get("funding_round") or "").lower()
+    if "pre-seed" in stage or "preseed" in stage:
+        return 9.0
+    if "seed" in stage:
+        return 12.0
+    if "series a" in stage:
+        return 14.0
+    if "series b" in stage:
+        return 12.0
+    if "series c" in stage:
+        return 9.0
+    if any(s in stage for s in ("series d", "series e", "series f", "pre-ipo", "ipo")):
+        return 6.0
+    return 7.0  # unknown — neutral
+
+
+def _funding_momentum_points(company: Dict[str, Any]) -> float:
+    """Round-size component, 0-8. A larger raise means more hiring budget."""
+    millions = _funding_millions(company.get("funding_amount", ""))
+    if millions is None:
+        return 3.0  # unknown — neutral
+    if millions >= 100:
+        return 8.0
+    if millions >= 50:
+        return 7.0
+    if millions >= 20:
+        return 6.0
+    if millions >= 5:
+        return 5.0
+    if millions >= 1:
+        return 4.0
+    return 3.0
+
+
+def _funding_millions(amount: str) -> Optional[float]:
+    """Parse "$130.0M" / "$50B" / "$900K" into millions. None when unparseable."""
+    text = (amount or "").strip().lower().replace(",", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([bmk])?", text)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    unit = match.group(2)
+    if unit == "b":
+        return value * 1000
+    if unit == "k":
+        return value / 1000
+    return value
+
+
+def _work_mode_points(company: Dict[str, Any]) -> float:
+    """Work-mode component, 0-5. Remote removes a relocation barrier."""
+    mode = (company.get("work_mode") or "").strip().lower()
+    if mode == "remote":
+        return 5.0
+    if mode == "hybrid":
+        return 3.0
+    if mode == "onsite":
+        return 1.0
+    if company.get("remote_friendly") is True:
+        return 5.0
+    return 2.0  # unknown — neutral
+
+
+def _seniority_points(company: Dict[str, Any], candidate_skills: List[str]) -> float:
+    """Seniority component, 0-5.
+
+    ``candidate_skills`` carries no experience data, so this rewards breadth
+    of stack as a proxy for depth of experience. It stays deterministic and
+    keeps a strong generalist ahead of a narrow profile at companies that
+    named a senior preference.
+    """
+    level = (company.get("preferred_experience_level") or "").strip().lower()
+    breadth = len({(s or "").strip().lower() for s in (candidate_skills or []) if s})
+
+    if level in ("senior", "principal", "staff"):
+        return 5.0 if breadth >= 8 else 2.0
+    if level in ("junior", "entry level", "entry-level", "new grad", "intern"):
+        return 5.0 if breadth <= 10 else 3.0
+    if level == "mid":
+        return 5.0 if breadth >= 5 else 3.0
+    return 3.0  # unknown — neutral
+
 
 
 def _select_top_matches(
@@ -534,7 +810,7 @@ def _select_top_matches(
     return results
 
 
-def run_weekly_report(db: Session) -> Dict[str, Any]:
+def run_weekly_report(db: Session, user_id: str) -> Dict[str, Any]:
     """Run the weekly career intelligence report workflow.
 
     Ticket-014 refactor: the orchestrator now exposes six explicit
@@ -548,8 +824,14 @@ def run_weekly_report(db: Session) -> Dict[str, Any]:
         Stage 5 - Opportunity Ranking
         Stage 6 - Report Assembly
 
+    Stage 1 is user-scoped; stages 2-6 are pure functions of
+    ``(candidate, companies)``, so scoping the resume lookup is
+    sufficient to make the whole report user-specific. The company set
+    itself stays global and identical for every user.
+
     Args:
         db: SQLAlchemy session.
+        user_id: Owner of the report. Only this user's resume is read.
 
     Returns:
         Dictionary with either:
@@ -559,11 +841,11 @@ def run_weekly_report(db: Session) -> Dict[str, Any]:
            technology_breakdown, top_strengths, top_skill_gaps}
         - {requires_resume: True, message}
     """
+    from app.services.user_scope import get_user_resume
+
     # ---------- Stage 1: Resume Intelligence ----------
     _log_stage("Reading Resume", 0.3)
-    latest_resume: Optional[Resume] = (
-        db.query(Resume).order_by(Resume.parsed_at.desc()).first()
-    )
+    latest_resume: Optional[Resume] = get_user_resume(db, user_id)
 
     if latest_resume is None:
         return {

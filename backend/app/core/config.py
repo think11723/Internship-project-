@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite:///./fundflow.db"
 
+    # ── Per-user data scoping ───────────────────────────────────────────
+    # When True, every personalized endpoint rejects requests that carry
+    # no user identity (401) instead of falling back to the shared
+    # ``anonymous`` bucket. See ``app.core.auth`` for the full contract.
+    #
+    # Defaults to False for development so curl / Postman calls without
+    # an ``X-User-Id`` header keep working. MUST be True in any
+    # deployment — with it False, two callers that both omit the header
+    # share one data bucket.
+    REQUIRE_USER_SCOPE: bool = False
+
     # Discovery cache TTL in hours
     DISCOVERY_CACHE_HOURS: int = 24
 

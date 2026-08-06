@@ -33,12 +33,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from typing import Any, Dict, List, Optional
 
+from app.core.auth import get_current_user_id
 from app.db.session import get_db
 from app.models.resume import Resume
 from app.services import orchestrator
 from app.services.career_action_planner import (
     build_career_action_plan_with_details,
 )
+from app.services.user_scope import get_user_resume
 
 router = APIRouter()
 
@@ -106,17 +108,21 @@ def _resume_dict_for_planner(resume: Resume) -> Dict[str, Any]:
 
 
 @router.get("/career-plan", summary="Aggregated Career Action Plan")
-async def get_career_plan(db: Session = Depends(get_db)):
-    """Aggregate the latest resume and the cached company list and
-    return the Career Action Planner's full output.
+async def get_career_plan(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Aggregate the authenticated user's resume and the cached company
+    list and return the Career Action Planner's full output.
+
+    The company list is GLOBAL; the plan built from it is entirely
+    derived from the caller's own resume.
 
     No resume? Same ``requires_resume`` envelope used by every other
     resume-aware endpoint on this API.
     """
-    # 1. Latest resume (single-active policy, ordered by parsed_at).
-    latest_resume: Optional[Resume] = (
-        db.query(Resume).order_by(Resume.parsed_at.desc()).first()
-    )
+    # 1. This user's resume (single-active policy, scoped by user_id).
+    latest_resume: Optional[Resume] = get_user_resume(db, user_id)
 
     # 2. Graceful empty state.
     if latest_resume is None:

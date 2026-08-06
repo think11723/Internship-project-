@@ -13,6 +13,17 @@ class Resume(Base):
     __tablename__ = "resumes"
     
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+
+    # Owning user (Firebase UID once auth lands; an opaque client-minted
+    # id in the interim — see ``app.core.auth``).
+    #
+    # Nullable at the column level ONLY so that ``ALTER TABLE ADD COLUMN``
+    # succeeds against deployed databases that already contain rows.
+    # Application code always sets it; ``_migrate_existing_schema`` in
+    # main.py backfills pre-migration rows to the ``legacy`` sentinel.
+    # Never query resumes without filtering on this column.
+    user_id = Column(String(128), index=True, nullable=True)
+
     original_filename = Column(String(255), nullable=False)
     file_path = Column(String(500), nullable=True)
     
@@ -45,4 +56,7 @@ class Resume(Base):
     parsed_at = Column(DateTime(timezone=True), server_default=func.now())
     
     def __repr__(self):
-        return f"<Resume(id={self.id}, filename='{self.original_filename}')>"
+        return (
+            f"<Resume(id={self.id}, user_id='{self.user_id}', "
+            f"filename='{self.original_filename}')>"
+        )

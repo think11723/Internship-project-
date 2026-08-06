@@ -214,6 +214,10 @@ def _migrate_existing_schema() -> None:
     """
     expected: dict[str, str] = {
         "file_size": "INTEGER",
+        # Per-user scoping. Added nullable because SQLite cannot add a
+        # NOT NULL column to a table that already has rows; the backfill
+        # below closes the gap.
+        "user_id": "VARCHAR(128)",
     }
     try:
         with engine.begin() as conn:
@@ -227,6 +231,32 @@ def _migrate_existing_schema() -> None:
                         f"ALTER TABLE resumes ADD COLUMN {column} {type_sql}"
                     )
                     logger.info("Migration: added resumes.%s column", column)
+
+            # Every personalized query filters on user_id, so it needs an
+            # index. ``create_all`` only builds indexes for tables it
+            # creates, which does not cover a pre-existing resumes table.
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_resumes_user_id "
+                "ON resumes (user_id)"
+            )
+
+            # Backfill rows that predate per-user scoping. They belong to
+            # whoever was using the single-user deployment; parking them
+            # under a reserved sentinel keeps them out of every real
+            # user's view without destroying them.
+            from app.core.auth import LEGACY_USER_ID
+
+            result = conn.exec_driver_sql(
+                "UPDATE resumes SET user_id = ? WHERE user_id IS NULL",
+                (LEGACY_USER_ID,),
+            )
+            if result.rowcount:
+                logger.info(
+                    "Migration: backfilled %d pre-migration resume row(s) "
+                    "to user_id='%s'",
+                    result.rowcount,
+                    LEGACY_USER_ID,
+                )
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Schema migration skipped: %s", exc)
 

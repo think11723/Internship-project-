@@ -1,5 +1,7 @@
 import React from 'react'
 import { Link, NavLink } from 'react-router-dom'
+import Brand from './Brand'
+import MobileNav from './MobileNav'
 
 const Navbar = () => {
   return (
@@ -9,28 +11,13 @@ const Navbar = () => {
     >
       <div className="absolute inset-0 backdrop-blur-md bg-background-card/90 border-b border-border-light" />
       <div className="relative flex items-center justify-between h-full px-6 sm:px-8 max-w-7xl mx-auto">
-        <Link
-          to="/"
-          className="flex items-center gap-3 group"
-          aria-label="FundFlow AI home"
-        >
-          <div className="w-10 h-10 bg-accent-lime rounded-pipeup flex items-center justify-center shadow-pipeup group-hover:shadow-pipeup-lg transition-all duration-pipeup group-hover:scale-105">
-            <span
-              className="text-dark-primary font-bold text-xl font-sans"
-              aria-hidden="true"
-            >
-              F
-            </span>
-          </div>
-          <div className="hidden sm:flex flex-col leading-tight">
-            <span className="text-lg font-bold text-dark-primary font-sans tracking-tight">
-              FundFlow AI
-            </span>
-            <span className="text-[10px] font-semibold text-gray-700 tracking-wide">
-              Autonomous Career Intelligence
-            </span>
-          </div>
-        </Link>
+        <div className="flex items-center">
+          {/* Hamburger trigger plus the drawer it controls. Both are
+              hidden at md and above, where the desktop sidebar takes over,
+              so this adds nothing to the desktop layout. */}
+          <MobileNav />
+          <Brand />
+        </div>
         <div className="flex items-center gap-3 sm:gap-5">
           <NavLink
             to="/dashboard"
